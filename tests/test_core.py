@@ -364,3 +364,44 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.core.execute(prepared).code, 'forbidden')
         self.assertEqual(self.fake.events('submitted'), [])
         self.assertFalse(self.lock.locked())
+
+
+    def test_help_names_exactly_the_three_creation_kinds(self):
+        expected = ("/agents | /bind | /bind <workspace_id> <pane_id> | /read | "
+                    "/new <项目别名> <codex或claude或devin> | /group-new <群名> | /confirm <确认码> | /cancel")
+        self.assertEqual(self.send("/unsupported").text,
+                         f"支持：{expected}。其他斜杠命令不会透传。")
+
+    def test_devin_proposal_is_pending_without_cli_or_binding_changes(self):
+        from unittest.mock import call, patch
+
+        self.core.projects = {"demo": self.root}
+        old = self.bind()
+        before = len(self.fake.events())
+        with patch("feishu_herdr_bridge.core.secrets.token_hex",
+                   side_effect=["01234567", "0123456789ab"]) as random_hex:
+            message = self.message("/new demo devin")
+            reply = self.core.handle(message)
+        self.assertEqual(reply.code, "creation_pending")
+        self.assertEqual(random_hex.call_args_list, [call(4), call(6)])
+        creation = self.store.find_creation("01234567", "chat-a", "user")
+        self.assertEqual((creation.agent_kind, creation.status), ("devin", "pending"))
+        self.assertEqual(creation.agent_name, "fb-devin-0123456789ab")
+        self.assertRegex(creation.agent_name, r"^fb-devin-[0-9a-f]{12}$")
+        self.assertEqual(creation.expires_at, self.now + 300)
+        self.assertIn("Agent：devin / fb-devin-0123456789ab", reply.text)
+        self.assertEqual(self.core.handle(message).code, "duplicate")
+        self.assertEqual(self.store.get_binding("chat-a"), old)
+        self.assertEqual(len(self.fake.events()), before)
+
+    def test_new_rejects_case_variants_fourth_kinds_and_extra_arguments(self):
+        self.core.projects = {"demo": self.root}
+        for kind in ("Devin", "DEVIN", "Codex", "CLAUDE", "shell", "other"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.send(f"/new demo {kind}").code, "invalid_agent")
+        self.assertEqual(self.send("/new demo devin --flag").code, "unknown_command")
+        self.assertEqual(self.send("/new not-allowed devin").code, "invalid_project")
+        self.assertEqual(self.send(f"/new {self.root} devin").code, "invalid_project")
+        self.assertEqual(self.fake.events(), [])
+        with closing(sqlite3.connect(self.store.path)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM create_requests").fetchone()[0], 0)

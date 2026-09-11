@@ -317,7 +317,7 @@ class HerdrAdapter:
 
     def start_agent(self, name: str, kind: str, pane_id: str) -> Agent:
         self._check_target(pane_id)
-        if not valid_agent_name(name) or kind not in {"codex", "claude"}:
+        if not valid_agent_name(name) or kind not in {"codex", "claude", "devin"}:
             raise HerdrError("invalid_agent")
         process = self._run((
             "agent", "start", name, "--kind", kind, "--pane", pane_id,
@@ -326,6 +326,8 @@ class HerdrAdapter:
         result = self._decode("start", process, writing=True)
         if len(result.agents) != 1 or result.agents[0].pane_id != pane_id:
             raise HerdrError("wrong_target", uncertain=True)
+        if result.agents[0].kind != kind:
+            raise HerdrError("start_unverified", uncertain=True)
         return result.agents[0]
 
     @staticmethod
@@ -360,7 +362,7 @@ def _agent_info(value: object) -> Agent:
         raise ValueError("Invalid AgentInfo metadata")
     # Detection/display values are optional. Never infer a kind from the name.
     kind = next((value[key] for key in ("agent", "display_agent")
-                 if isinstance(value.get(key), str) and value[key] in {"codex", "claude"}), "unknown")
+                 if isinstance(value.get(key), str) and value[key] in {"codex", "claude", "devin"}), "unknown")
     return Agent(value["workspace_id"], value["pane_id"], value.get("name"), kind,
                  value["agent_status"], value["tab_id"])
 

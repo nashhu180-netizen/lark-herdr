@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -173,11 +174,141 @@ CREATE TABLE group_requests (
 """
 
 
+# Keep _SCHEMA and _GROUP_SCHEMA frozen as the accepted v0/v1 definitions.
+_CREATE_REQUESTS_V2 = """
+CREATE TABLE create_requests (
+    request_id TEXT PRIMARY KEY,
+    confirmation_code TEXT NOT NULL UNIQUE,
+    chat_id TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    project_path TEXT NOT NULL,
+    workspace_label TEXT NOT NULL,
+    agent_kind TEXT NOT NULL CHECK (agent_kind IN ('codex','claude','devin')),
+    agent_name TEXT NOT NULL,
+    original_revision INTEGER,
+    expires_at REAL NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('pending','processing','done','failed','unknown')
+    ),
+    workspace_id TEXT,
+    tab_id TEXT,
+    pane_id TEXT,
+    result_code TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+"""
+_COPY_COLUMNS = (
+    "rowid", "request_id", "confirmation_code", "chat_id", "requested_by", "project_path",
+    "workspace_label", "agent_kind", "agent_name", "original_revision", "expires_at",
+    "status", "workspace_id", "tab_id", "pane_id", "result_code", "created_at", "updated_at",
+)
+_INDEX_KEYS = {
+    "bindings": {("pk", ("chat_id",)), ("u", ("herdr_session", "workspace_id"))},
+    "requests": {("pk", ("message_id",))},
+    "create_requests": {("pk", ("request_id",)), ("u", ("confirmation_code",))},
+    "group_requests": {("pk", ("request_id",)), ("u", ("confirmation_code",)),
+                       ("u", ("create_uuid",)), ("u", ("created_chat_id",))},
+}
+
+
+def _normalized_ddl(sql: str) -> str:
+    # Whitespace outside literals is insignificant; literal contents are not.
+    if not isinstance(sql, str):
+        raise SchemaMismatch("Missing table definition")
+    pieces = re.split(r"('(?:[^']|'')*')", sql.strip().removesuffix(";"))
+    normalized = "".join(piece if i % 2 else re.sub(r"\s+", " ", piece)
+                         for i, piece in enumerate(pieces))
+    prefix = "CREATE TABLE IF NOT EXISTS "
+    return "CREATE TABLE " + normalized[len(prefix):] if normalized.startswith(prefix) else normalized
+
+
 def _schema_definitions(sql: str) -> dict[str, str]:
-    # Only our fixed DDL is accepted, including its constraints. No repair engine.
-    statements = (part.strip() for part in sql.split(";") if part.strip())
-    normalized = (" ".join(part.replace("IF NOT EXISTS ", "").split()) for part in statements)
-    return {part.split()[2]: part for part in normalized}
+    # This splits only the fixed, trusted DDL constants, never database SQL.
+    statements = (_normalized_ddl(part) for part in sql.split(";") if part.strip())
+    return {part.split()[2]: part for part in statements}
+
+
+def _expected_tables(version: int) -> dict[str, str]:
+    tables = _schema_definitions(_SCHEMA + (_GROUP_SCHEMA if version >= 1 else ""))
+    if version == 2:
+        tables.update(_schema_definitions(_CREATE_REQUESTS_V2))
+    return tables
+
+
+def _validate_schema(db: sqlite3.Connection, version: int) -> dict[str, str]:
+    objects = db.execute("SELECT type, name, tbl_name, sql FROM sqlite_master").fetchall()
+    tables = {row["name"]: row["sql"] for row in objects
+              if row["type"] == "table" and not row["name"].startswith("sqlite_")}
+    expected = {} if version == 0 and not tables else _expected_tables(version)
+    if tables.keys() != expected.keys():
+        raise SchemaMismatch("Conflicting database tables")
+    for name, sql in tables.items():
+        accepted = {expected[name]}
+        if version == 2 and name == "create_requests":
+            # ALTER TABLE quotes the destination table identifier. No other
+            # identifier/literal/constraint normalization is permitted.
+            accepted.add(expected[name].replace("CREATE TABLE create_requests ",
+                                               'CREATE TABLE "create_requests" ', 1))
+        if _normalized_ddl(sql) not in accepted:
+            raise SchemaMismatch("Conflicting table definition")
+    catalog_indexes = set()
+    for row in objects:
+        if row["type"] in {"view", "trigger"}:
+            raise SchemaMismatch("Unexpected view or trigger")
+        if row["type"] == "index":
+            if row["sql"] is not None or row["tbl_name"] not in expected:
+                raise SchemaMismatch("Unexpected explicit index")
+            catalog_indexes.add(row["name"])
+    seen_indexes = set()
+    for name in expected:
+        if db.execute("SELECT 1 FROM pragma_foreign_key_list(?)", (name,)).fetchone():
+            raise SchemaMismatch("Unexpected foreign key")
+        indexes = db.execute("SELECT * FROM pragma_index_list(?)", (name,)).fetchall()
+        keys = set()
+        for index in indexes:
+            if index["unique"] != 1 or index["partial"] != 0 or index["origin"] not in {"pk", "u"}:
+                raise SchemaMismatch("Conflicting index properties")
+            columns = [row for row in db.execute(
+                "SELECT * FROM pragma_index_xinfo(?) ORDER BY seqno", (index["name"],)
+            ) if row["key"] == 1]
+            if not columns or any(row["cid"] < 0 or row["desc"] != 0 or row["coll"] != "BINARY"
+                                  for row in columns):
+                raise SchemaMismatch("Conflicting index columns")
+            keys.add((index["origin"], tuple(row["name"] for row in columns)))
+            seen_indexes.add(index["name"])
+        if keys != _INDEX_KEYS[name] or len(indexes) != len(_INDEX_KEYS[name]):
+            raise SchemaMismatch("Missing or extra constraint index")
+    if seen_indexes != catalog_indexes:
+        raise SchemaMismatch("Conflicting index inventory")
+    return expected
+
+
+def _check_integrity(db: sqlite3.Connection) -> None:
+    rows = db.execute("PRAGMA integrity_check").fetchall()
+    if len(rows) != 1 or rows[0][0] != "ok":
+        # Do not disclose row contents or silently accept invalid old kinds.
+        raise SchemaMismatch("Database integrity check failed")
+
+
+def _migrate_create_requests(db: sqlite3.Connection) -> None:
+    staging = "create_requests_v2_migration"
+    db.execute(_CREATE_REQUESTS_V2.replace("CREATE TABLE create_requests ",
+                                         f"CREATE TABLE {staging} ", 1))
+    columns = ", ".join(_COPY_COLUMNS)
+    db.execute(f"INSERT INTO {staging} ({columns}) SELECT {columns} FROM create_requests")
+    sizes = db.execute(f"SELECT (SELECT count(*) FROM create_requests), "
+                       f"(SELECT count(*) FROM {staging})").fetchone()
+    if sizes[0] != sizes[1]:
+        raise SchemaMismatch("Migration row count mismatch")
+    # Include storage classes so SQL's numeric equality cannot hide conversion.
+    values = ", ".join(f"{column}, typeof({column})" for column in _COPY_COLUMNS)
+    for source, target in (("create_requests", staging), (staging, "create_requests")):
+        if db.execute(f"SELECT {values} FROM {source} EXCEPT "
+                      f"SELECT {values} FROM {target} LIMIT 1").fetchone() is not None:
+            raise SchemaMismatch("Migration row value mismatch")
+    db.execute("DROP TABLE create_requests")
+    db.execute(f"ALTER TABLE {staging} RENAME TO create_requests")
 
 
 class Store:
@@ -188,24 +319,23 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._transaction() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise SchemaMismatch("Unsupported database version")
-            expected = _schema_definitions(_SCHEMA + (_GROUP_SCHEMA if version == 1 else ""))
-            actual = dict(db.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            ).fetchall())
-            if actual or version == 1:
-                normalized = {name: next(iter(_schema_definitions(sql).values())) for name, sql in actual.items()}
-                if normalized != expected:
-                    raise SchemaMismatch("Conflicting database schema")
-            else:
-                for statement in _SCHEMA.split(";"):
-                    if statement.strip():
-                        db.execute(statement)
-            if version == 0:
-                # execute(), not executescript(): DDL and version advance commit together.
-                db.execute(_GROUP_SCHEMA)
-                db.execute("PRAGMA user_version=1")
+            tables = _validate_schema(db, version)
+            _check_integrity(db)
+            if not tables:
+                for definition in _expected_tables(2).values():
+                    db.execute(definition)
+            elif version < 2:
+                if version == 0:
+                    # Historical v0 -> v1 -> v2 shares this one outer transaction.
+                    db.execute(_GROUP_SCHEMA)
+                _migrate_create_requests(db)
+            _validate_schema(db, 2)
+            _check_integrity(db)
+            if version != 2:
+                # This is the last statement before the transaction commits.
+                db.execute("PRAGMA user_version=2")
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

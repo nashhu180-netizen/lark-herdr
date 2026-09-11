@@ -271,3 +271,107 @@ class Protocol22Tests(unittest.TestCase):
         with self.assertRaises(HerdrError):
             self.adapter.create_workspace("relative", "label")
         self.assertEqual(self.calls, [])
+
+
+    def test_protocol_list_get_start_recognize_devin_without_changing_labels(self):
+        from feishu_herdr_bridge.herdr import decode_protocol22
+
+        self.fixture["list"]["result"]["agents"][0]["agent"] = "devin"
+        self.fixture["list"]["result"]["agents"][0].pop("display_agent")
+        for action in ("get", "start"):
+            self.fixture[action]["result"]["agent"]["agent"] = "devin"
+            self.fixture[action]["result"]["agent"].pop("display_agent")
+        for action in ("list", "get", "start"):
+            with self.subTest(action=action):
+                result = decode_protocol22(action, json.dumps(self.fixture[action]))
+                self.assertEqual(result.agents[0].kind, "devin")
+        agents = self.adapter.list_agents_with_labels()
+        self.assertEqual([(a.kind, a.workspace_label, a.tab_label) for a in agents],
+                         [("devin", "Project Alpha", "主控"), ("claude", "项目乙", "Review B")])
+        self.assertEqual(self.adapter.get_agent("pane-a").kind, "devin")
+
+    def test_agent_primary_precedence_and_explicit_display_fallback(self):
+        from feishu_herdr_bridge.herdr import decode_protocol22
+
+        agent = self.fixture["get"]["result"]["agent"]
+        cases = (("devin", "claude", "devin"), ("claude", "devin", "claude"),
+                 ("codex", "devin", "codex"), (None, "devin", "devin"),
+                 ("unrecognized", "devin", "devin"), (None, None, "unknown"),
+                 ("Devin", "DEVIN", "unknown"), ("other", "other", "unknown"))
+        for primary, display, expected in cases:
+            with self.subTest(primary=primary, display=display):
+                agent.update(agent=primary, display_agent=display, name="fb-devin-0123456789ab")
+                self.assertEqual(decode_protocol22("get", json.dumps(self.fixture["get"])).agents[0].kind,
+                                 expected)
+
+    def test_devin_start_uses_fixed_session_root_pane_and_existing_timeout(self):
+        from feishu_herdr_bridge.herdr import decode_protocol22, session_command
+
+        self.fixture["start"]["result"]["agent"].update(agent="devin", display_agent="devin")
+        adapter = HerdrAdapter("kpi-agg", command_builder=session_command("/configured/herdr"),
+                               decoder=decode_protocol22, runner=self.adapter._runner, write_timeout=7.5)
+        created = adapter.create_workspace("/allowed/project", "fixture-label")
+        agent = adapter.start_agent("fb-devin-0123456789ab", "devin", created.pane_id)
+        self.assertEqual((agent.workspace_id, agent.pane_id, agent.kind),
+                         (created.workspace_id, created.pane_id, "devin"))
+        self.assertEqual(self.calls, [
+            ["/configured/herdr", "--session", "kpi-agg", "workspace", "create", "--cwd",
+             "/allowed/project", "--label", "fixture-label", "--no-focus"],
+            ["/configured/herdr", "--session", "kpi-agg", "agent", "start", "fb-devin-0123456789ab",
+             "--kind", "devin", "--pane", created.pane_id, "--timeout", "7500"],
+        ])
+
+    def test_start_requires_requested_kind_for_all_three_supported_kinds(self):
+        for requested in ("codex", "claude", "devin"):
+            for actual in ("codex", "claude", "devin", "unknown"):
+                with self.subTest(requested=requested, actual=actual):
+                    self.fixture["start"]["result"]["agent"].update(agent=actual, display_agent=actual)
+                    before = len(self.calls)
+                    if actual == requested:
+                        self.assertEqual(self.adapter.start_agent("fixture-agent", requested, "pane-new").kind,
+                                         requested)
+                    else:
+                        with self.assertRaises(HerdrError) as error:
+                            self.adapter.start_agent("fixture-agent", requested, "pane-new")
+                        self.assertEqual(error.exception.code, "start_unverified")
+                        self.assertTrue(error.exception.uncertain)
+                    self.assertEqual(len(self.calls), before + 1)
+
+    def test_devin_start_rejects_cardinality_pane_and_malformed_response(self):
+        from feishu_herdr_bridge.herdr import Agent
+
+        valid = Agent("workspace-new", "pane-new", None, "devin")
+        other = Agent("workspace-other", "pane-other", None, "devin")
+        for agents in ((), (other,), (valid, other)):
+            with self.subTest(agents=agents), patch.object(self.adapter, "_decoder",
+                    return_value=ControlResult(agents=agents)):
+                before = len(self.calls)
+                with self.assertRaises(HerdrError) as error:
+                    self.adapter.start_agent("fixture-agent", "devin", "pane-new")
+                self.assertEqual(error.exception.code, "wrong_target")
+                self.assertTrue(error.exception.uncertain)
+                self.assertEqual(len(self.calls), before + 1)
+        del self.fixture["start"]["result"]["agent"]["workspace_id"]
+        with self.assertRaises(HerdrError) as error:
+            self.adapter.start_agent("fixture-agent", "devin", "pane-new")
+        self.assertEqual(error.exception.code, "invalid_output")
+        self.assertTrue(error.exception.uncertain)
+
+    def test_devin_start_keeps_stderr_error_semantics_and_does_not_retry(self):
+        calls = []
+        def failed(command, timeout):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, 1, "", json.dumps(self.fixture["error"]))
+        with patch.object(self.adapter, "_runner", side_effect=failed):
+            with self.assertRaises(HerdrError) as error:
+                self.adapter.start_agent("fixture-agent", "devin", "pane-new")
+        self.assertEqual(error.exception.code, "remote_error")
+        self.assertTrue(error.exception.uncertain)
+        self.assertEqual(len(calls), 1)
+
+    def test_start_does_not_expose_other_herdr_kinds_or_case_aliases(self):
+        for kind in ("Devin", "DEVIN", "Codex", "Claude", "shell", "other"):
+            with self.subTest(kind=kind), self.assertRaises(HerdrError) as error:
+                self.adapter.start_agent("fixture-agent", kind, "pane-new")
+            self.assertEqual(error.exception.code, "invalid_agent")
+        self.assertEqual(self.calls, [])
