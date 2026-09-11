@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
+from contextlib import closing
 import subprocess
 import tempfile
 import threading
@@ -299,3 +301,16 @@ class CreationTests(unittest.TestCase):
         self.assertEqual(self.confirm(creation).code, "confirmation_used")
         self.assertEqual((len(self.cli.created), len(self.cli.started)), (1, 1))
         self.assertEqual(self.store.get_binding("chat-a"), old)
+
+
+    def test_old_workspace_confirmation_survives_schema_upgrade(self):
+        creation = self.propose()
+        # Reproduce the old three-table database with its pending confirmation.
+        with closing(sqlite3.connect(self.store.path)) as db:
+            db.execute('DROP TABLE group_requests')
+            db.execute('PRAGMA user_version=0')
+        self.store = Store(self.store.path)
+        self.core = self.make_core()
+        self.assertEqual(self.confirm(creation).code, 'created')
+        self.assertEqual((len(self.cli.created), len(self.cli.started)), (1, 1))
+        self.assertEqual(self.store.get_binding('chat-a').pane_id, self.cli.created[0][2])

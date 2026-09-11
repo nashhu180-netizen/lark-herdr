@@ -7,8 +7,11 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
-from feishu_herdr_bridge.store import BindingChanged, Store, WorkspaceOccupied
+from feishu_herdr_bridge.store import (
+    BindingChanged, SchemaMismatch, Store, WorkspaceOccupied, _GROUP_SCHEMA, _SCHEMA,
+)
 
 
 class StoreTests(unittest.TestCase):
@@ -29,10 +32,10 @@ class StoreTests(unittest.TestCase):
             action="prompt", snapshot=snapshot, now=101.0,
         )
 
-    def test_schema_contains_only_the_three_design_tables(self):
+    def test_schema_contains_only_the_four_design_tables(self):
         with closing(sqlite3.connect(self.store.path)) as db:
             names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(names, {"bindings", "requests", "create_requests"})
+        self.assertEqual(names, {"bindings", "requests", "create_requests", "group_requests"})
 
     def test_binding_survives_reopening_and_revisions_increase(self):
         first = self.bind()
@@ -134,3 +137,120 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_request("message").status, "done")
         with self.assertRaises(ValueError):
             self.store.finish("message", "processing", "bad", 103.0)
+
+
+class MigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "legacy.sqlite3"
+
+    def legacy(self):
+        # _SCHEMA is the unchanged three-table DDL from ea6b22a.
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.executescript(_SCHEMA)
+            db.execute("INSERT INTO bindings VALUES ('chat','kpi-agg','w','p','lead',1,1,100,'user')")
+            db.execute("""INSERT INTO requests VALUES
+                       ('m','chat','user','new',1,'kpi-agg','w','p','processing','',100,100)""")
+            db.execute("""INSERT INTO create_requests VALUES
+                       ('m','12345678','chat','user','/project','label','codex','lead',1,
+                        9999999999,'pending',NULL,NULL,NULL,'',100,100)""")
+
+    def snapshot(self):
+        with closing(sqlite3.connect(self.path)) as db:
+            return {table: db.execute(f"SELECT * FROM {table}").fetchall()
+                    for table in ("bindings", "requests", "create_requests")}
+
+    def test_old_data_pending_codes_and_version_survive_idempotent_upgrade(self):
+        self.legacy()
+        before = self.snapshot()
+        Store(self.path)
+        Store(self.path)
+        self.assertEqual(self.snapshot(), before)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 1)
+            self.assertEqual(db.execute('SELECT count(*) FROM group_requests').fetchone()[0], 0)
+        self.assertEqual(Store(self.path).find_creation('12345678', 'chat', 'user').status, 'pending')
+
+    def test_unknown_version_fails_before_any_recovery_or_schema_write(self):
+        self.legacy()
+        before = self.snapshot()
+        with closing(sqlite3.connect(self.path)) as db:
+            db.execute('PRAGMA user_version=42')
+        with self.assertRaises(SchemaMismatch):
+            Store(self.path)
+        self.assertEqual(self.snapshot(), before)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 42)
+            self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='group_requests'").fetchone())
+
+    def test_migration_failure_rolls_back_ddl_and_version_for_old_and_new_databases(self):
+        connect = sqlite3.connect
+
+        class FailingVersion(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if sql == 'PRAGMA user_version=1':
+                    raise sqlite3.OperationalError('Injected version-write failure')
+                return super().execute(sql, parameters)
+
+        def broken_connection(*args, **kwargs):
+            return connect(*args, factory=FailingVersion, **kwargs)
+
+        for old in (False, True):
+            with self.subTest(old=old):
+                if old:
+                    self.legacy()
+                with patch('feishu_herdr_bridge.store.sqlite3.connect', side_effect=broken_connection):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        Store(self.path)
+                with closing(connect(self.path)) as db:
+                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 0)
+                    self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='group_requests'").fetchone())
+                    count = db.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+                    self.assertEqual(count, 3 if old else 0)
+        self.assertEqual(Store(self.path).get_request('m').status, 'processing')
+
+    def test_existing_unversioned_group_table_is_not_silently_adopted(self):
+        self.legacy()
+        with closing(sqlite3.connect(self.path)) as db:
+            db.execute(_GROUP_SCHEMA)
+        with self.assertRaises(SchemaMismatch):
+            Store(self.path)
+
+    def test_version_one_rejects_missing_check_unique_or_table(self):
+        Store(self.path)
+        check = ",\n    CHECK (status <> 'done' OR (created_chat_id IS NOT NULL AND length(created_chat_id) > 0))"
+        variants = (_GROUP_SCHEMA.replace(check, ''),
+                    _GROUP_SCHEMA.replace('created_chat_id TEXT UNIQUE', 'created_chat_id TEXT'), None)
+        for ddl in variants:
+            with self.subTest(ddl=ddl is not None), closing(sqlite3.connect(self.path)) as db:
+                db.execute('DROP TABLE IF EXISTS group_requests')
+                if ddl:
+                    db.execute(ddl)
+                with self.assertRaises(SchemaMismatch):
+                    Store(self.path)
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 1)
+
+    def test_database_enforces_done_nonempty_id_unique_and_fixed_session(self):
+        Store(self.path)
+        first = ['r1', 'g-' + '1' * 16, 'management', 'admin', 'demo', 'uuid-1',
+                 'kpi-agg', 'bot', None, 'done', '', 400, 100, 100]
+        with closing(sqlite3.connect(self.path)) as db, db:
+            for chat_id in (None, ''):
+                first[8] = chat_id
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.execute('INSERT INTO group_requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', first)
+            first[8], first[9] = None, 'pending'
+            db.execute('INSERT INTO group_requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', first)
+            for chat_id in (None, ''):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.execute("UPDATE group_requests SET status='done', created_chat_id=? WHERE request_id='r1'", (chat_id,))
+            second = first.copy()
+            second[0], second[1], second[5] = 'r2', 'g-' + '2' * 16, 'uuid-2'
+            db.execute('INSERT INTO group_requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', second)
+            db.execute("UPDATE group_requests SET status='done', created_chat_id='unique-chat' WHERE request_id='r1'")
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("UPDATE group_requests SET created_chat_id='unique-chat' WHERE request_id='r2'")
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("UPDATE group_requests SET herdr_session='other-session' WHERE request_id='r2'")
+            self.assertEqual(db.execute('SELECT count(*) FROM group_requests').fetchone()[0], 2)
