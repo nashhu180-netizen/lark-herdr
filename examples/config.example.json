@@ -1,0 +1,12 @@
+{
+  "herdr_executable": "/absolute/path/to/herdr",
+  "herdr_session": "replace-with-prestarted-session",
+  "bot_open_id": "replace-with-bot-open-id",
+  "allowed_users": ["replace-with-user-open-id"],
+  "allowed_chats": ["replace-with-chat-id"],
+  "projects": {
+    "demo": "/absolute/path/to/allowed/project"
+  },
+  "query_timeout": 5.0,
+  "write_timeout": 15.0
+}

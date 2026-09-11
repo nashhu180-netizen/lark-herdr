@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feishu-herdr-bridge"
+version = "0.1.0"
+description = "Offline-testable core for a minimal Feishu to HerdR bridge"
+requires-python = ">=3.11"
+dependencies = ["lark-oapi==1.7.3"]
+
+[tool.setuptools.packages.find]
+include = ["feishu_herdr_bridge*"]

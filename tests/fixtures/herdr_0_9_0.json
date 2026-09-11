@@ -1,0 +1,113 @@
+{
+  "_meta": {
+    "herdr_version": "0.9.0",
+    "protocol": 22,
+    "source": "schema-derived/static-not-live",
+    "live_probe": "pending",
+    "note": "Constructed from the bundled protocol-22 schema, not captured from a running session. Status values and identifiers are illustrative; CLI rendering and error-code meanings still require local live validation.",
+    "recorded_at": "2026-09-11"
+  },
+  "list": {
+    "id": "static-agent_list",
+    "result": {
+      "type": "agent_list",
+      "agents": [
+        {
+          "workspace_id": "workspace-a",
+          "tab_id": "tab-a",
+          "pane_id": "pane-a",
+          "terminal_id": "terminal-pane-a",
+          "agent_status": "idle",
+          "focused": false,
+          "revision": 1,
+          "name": "lead-a",
+          "agent": "codex",
+          "display_agent": "codex"
+        },
+        {
+          "workspace_id": "workspace-b",
+          "tab_id": "tab-b",
+          "pane_id": "pane-b",
+          "terminal_id": "terminal-pane-b",
+          "agent_status": "idle",
+          "focused": false,
+          "revision": 1,
+          "name": "lead-b",
+          "agent": "claude",
+          "display_agent": "claude"
+        }
+      ]
+    }
+  },
+  "get": {
+    "id": "static-agent_info",
+    "result": {
+      "type": "agent_info",
+      "agent": {
+        "workspace_id": "workspace-a",
+        "tab_id": "tab-a",
+        "pane_id": "pane-a",
+        "terminal_id": "terminal-pane-a",
+        "agent_status": "idle",
+        "focused": false,
+        "revision": 1,
+        "name": "lead-a",
+        "agent": "codex",
+        "display_agent": "codex"
+      }
+    }
+  },
+  "prompt": {
+    "id": "static-agent_prompted",
+    "result": {
+      "type": "agent_prompted"
+    }
+  },
+  "create": {
+    "id": "static-workspace_created",
+    "result": {
+      "type": "workspace_created",
+      "workspace": {
+        "workspace_id": "workspace-new"
+      },
+      "tab": {
+        "tab_id": "tab-new",
+        "workspace_id": "workspace-new"
+      },
+      "root_pane": {
+        "pane_id": "pane-new",
+        "workspace_id": "workspace-new",
+        "tab_id": "tab-new"
+      }
+    }
+  },
+  "start": {
+    "id": "static-agent_started",
+    "result": {
+      "type": "agent_started",
+      "agent": {
+        "workspace_id": "workspace-new",
+        "tab_id": "tab-new",
+        "pane_id": "pane-new",
+        "terminal_id": "terminal-pane-new",
+        "agent_status": "idle",
+        "focused": false,
+        "revision": 1,
+        "name": "fb-codex-0123456789ab",
+        "agent": "codex",
+        "display_agent": "codex"
+      },
+      "argv": [
+        "codex"
+      ]
+    }
+  },
+  "error": {
+    "id": "static-error",
+    "error": {
+      "code": "EXAMPLE_UNVERIFIED_CODE",
+      "message": "Synthetic error; meaning is not live verified."
+    }
+  },
+  "read_text": "Illustrative plain terminal output\n"
+}
