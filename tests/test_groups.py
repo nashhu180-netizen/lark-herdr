@@ -563,3 +563,98 @@ class GroupTests(unittest.TestCase):
         self.assertEqual(self.core.execute(prepared).code, 'forbidden')
         self.assertEqual(len(self.cli.calls), before)
         self.assertFalse(self.core._lock.locked())
+
+
+class GroupEventEntryTests(unittest.TestCase):
+    def test_entry_uses_core_authorization_and_rejects_mismatched_bot(self):
+        from feishu_herdr_bridge.feishu import FeishuBridge
+        from tests.test_feishu import event, BOT
+
+        core = Mock(bot_open_id=BOT)
+        core.is_authorized.return_value = False
+        bridge = FeishuBridge(core, BOT, Mock())
+        self.assertIsNone(bridge.receive(event('/agents', group=True)))
+        normalized = core.is_authorized.call_args.args[0]
+        self.assertEqual(normalized.chat_type, 'group')
+        core.prepare.assert_not_called()
+        with self.assertRaises(ValueError):
+            FeishuBridge(core, 'another-bot', Mock())
+        core.bot_open_id = 'changed-bot'
+        self.assertIsNone(bridge.receive(event('/agents', group=True)))
+        core.prepare.assert_not_called()
+
+
+class SDKGroupEntryTests(unittest.TestCase):
+    def test_created_group_is_immediately_allowed_with_all_existing_commands(self):
+        from feishu_herdr_bridge.feishu import FeishuBridge
+        from tests.test_feishu import GroupHTTPFixture, event
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wire = GroupHTTPFixture(self)
+            core = wire.core(root)
+            received = []
+            bridge = FeishuBridge(core, wire.bot, lambda m, r: received.append(r))
+            sequence = 0
+
+            def send(text, chat='management', user=None, group=True):
+                nonlocal sequence
+                sequence += 1
+                data = event(text, f'entry-{sequence}', chat, user or wire.owner, group)
+                for mention in data['event']['message']['mentions']:
+                    mention['id']['open_id'] = wire.bot
+                before = len(received)
+                worker = bridge.receive(data)
+                if worker:
+                    worker.join(5)
+                    self.assertFalse(worker.is_alive())
+                return received[-1] if len(received) > before else None
+
+            groups = []
+            for suffix in ('a', 'b'):
+                proposal = send('/group-new ' + suffix)
+                self.assertEqual(proposal.code, 'group_pending')
+                code = re.search(r'g-[0-9a-f]{16}', proposal.text).group()
+                chat_id = 'oc_entry_fixture_' + suffix
+                wire.payload['data']['chat_id'] = chat_id
+                result = send('/confirm ' + code)
+                self.assertEqual(result.code, 'group_created')
+                self.assertNotIn(chat_id, result.text)
+                groups.append(chat_id)
+                self.assertNotIn(chat_id, core.allowed_chats)
+                self.assertIsNone(core.store.get_binding(chat_id))
+                self.assertEqual(send('before binding', chat_id).code, 'unbound')
+                self.assertEqual(send('/agents', chat_id).code, 'agents')
+                self.assertEqual(send('/group-new nested', chat_id).code, 'forbidden')
+            a, b = groups
+            self.assertEqual(send('/bind workspace-a pane-a', a).code, 'bound')
+            self.assertEqual(send('/bind workspace-a pane-a', b).code, 'workspace_occupied')
+            self.assertEqual(send('/bind workspace-b pane-b', b).code, 'bound')
+            self.assertEqual(send('/bind', a).code, 'binding')
+            self.assertEqual(send('A_ONLY', a).code, 'submitted')
+            self.assertEqual(send('B_ONLY', b).code, 'submitted')
+            self.assertEqual(wire.cli.submitted, [('pane-a', 'A_ONLY'), ('pane-b', 'B_ONLY')])
+            self.assertIn('pane-a', send('/read', a).text)
+            self.assertIn('pane-b', send('/read', b).text)
+            self.assertEqual(send('/new demo codex', a).code, 'creation_pending')
+            self.assertEqual(send('/cancel', a).code, 'cancelled')
+            pending = send('/new demo codex', a)
+            code = re.search(r'/confirm ([0-9a-f]{8})', pending.text).group(1)
+            self.assertEqual(send('/confirm ' + code, a).code, 'created')
+            self.assertEqual(len(wire.posts), 2)
+            self.assertIsNone(core.store.get_binding('management'))
+            self.assertIsNone(send('/agents', a, user='not-allowed'))
+            self.assertIsNone(send('/agents', 'stranger-chat'))
+            self.assertIsNone(send('/agents', a, group=False))
+            with patch.object(core.store, 'group_allowed', side_effect=sqlite3.OperationalError('PRIVATE')):
+                self.assertIsNone(send('/agents', a))
+            # Restart with creation disabled, but retain the current bot identity.
+            binding = core.store.get_binding(a)
+            core = BridgeCore(Store(core.store.path), wire.cli.adapter(), allowed_users={wire.owner},
+                              allowed_chats={'management'}, bot_open_id=wire.bot,
+                              clock=lambda: 100.0, operation_lock=threading.Lock())
+            bridge = FeishuBridge(core, wire.bot, lambda m, r: received.append(r))
+            self.assertEqual(core.store.get_binding(a), binding)
+            self.assertEqual(send('/read', a).code, 'read')
+            self.assertEqual(send('/group-new disabled').code, 'forbidden')
+            self.assertEqual(len(wire.posts), 2)

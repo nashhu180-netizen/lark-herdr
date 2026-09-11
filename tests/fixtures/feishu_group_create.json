@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "sdk_version": "1.7.3",
+    "source": "schema-derived/static-not-live",
+    "live_validation": "pending",
+    "note": "All IDs, tokens, names and responses below are synthetic test data.",
+    "recorded_at": "2026-09-11"
+  },
+  "app_id": "cli_g2_fixture",
+  "app_secret": "fixture-not-a-real-secret",
+  "bot_open_id": "ou_g2_fixture_bot",
+  "owner_id": "ou_g2_fixture_admin",
+  "tenant_response": {
+    "code": 0,
+    "msg": "ok",
+    "tenant_access_token": "t_g2_fixture_only",
+    "expire": 7200
+  },
+  "create_response": {
+    "code": 0,
+    "msg": "ok",
+    "data": {
+      "chat_id": "oc_g2_fixture_created",
+      "owner_id": "ou_g2_fixture_admin",
+      "owner_id_type": "open_id",
+      "chat_mode": "group",
+      "chat_type": "private",
+      "external": false
+    }
+  }
+}

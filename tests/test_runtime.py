@@ -340,7 +340,7 @@ with patch.object(entry.Path, 'home', return_value=root), patch.object(entry, 'L
             pass
 
     def test_signal_handlers_restore_and_second_signal_does_not_interrupt_cleanup(self):
-        runtime = entry.BridgeRuntime(Mock(), "bot", Mock(), ManagedRunner())
+        runtime = entry.BridgeRuntime(Mock(bot_open_id=None), "bot", Mock(), ManagedRunner())
         previous = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
         with entry.shutdown_signals(runtime):
             handler = signal.getsignal(signal.SIGTERM)
@@ -367,3 +367,89 @@ with patch.object(entry.Path, 'home', return_value=root), patch.object(entry, 'L
         self.assertIn("UMask=0077", service)
         self.assertNotIn("HERDR_ENV=1", service)
         self.assertNotIn("FEISHU_APP_SECRET=", service)
+
+    def test_group_configuration_is_opt_in_complete_and_fail_closed(self):
+        base = json.loads(self.config.read_text())
+        legacy = entry.load_config(self.config)
+        self.assertIsNone(legacy.management_chat_id)
+        self.assertEqual(legacy.admin_users, frozenset())
+        disabled = {**base, 'management_chat_id': None, 'admin_users': []}
+        self.config.write_text(json.dumps(disabled))
+        self.assertIsNone(entry.load_config(self.config).management_chat_id)
+        enabled = {**base, 'herdr_session': 'kpi-agg', 'management_chat_id': 'chat', 'admin_users': ['user']}
+        self.config.write_text(json.dumps(enabled))
+        parsed = entry.load_config(self.config)
+        self.assertEqual((parsed.session, parsed.management_chat_id, parsed.admin_users),
+                         ('kpi-agg', 'chat', frozenset({'user'})))
+        invalid = [{**base, 'management_chat_id': None}, {**base, 'admin_users': []}]
+        invalid += [{**enabled, key: value} for key, value in (
+            ('herdr_session', 'other-session'), ('management_chat_id', None),
+            ('management_chat_id', 'untrusted'), ('admin_users', []), ('admin_users', None),
+            ('admin_users', 'user'), ('admin_users', ['outsider']), ('bot_open_id', ''),
+            ('bot_open_id', None), ('bot_open_id', 'bad\nid'),
+        )]
+        for config in invalid:
+            with self.subTest(config=config):
+                self.config.write_text(json.dumps(config))
+                with self.assertRaises(ValueError):
+                    entry.load_config(self.config)
+                with patch.object(entry, 'InstanceLock') as lock, patch.object(entry, 'LarkTransport') as sdk, redirect_stderr(StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        entry.main(['--config', str(self.config)], env=self.credentials)
+                self.assertEqual(error.exception.code, 2)
+                lock.assert_not_called()
+                sdk.assert_not_called()
+
+    def test_main_wires_management_creator_identity_and_live_stop_gate(self):
+        from feishu_herdr_bridge.core import GroupCreateResult
+        from tests.test_feishu import event
+        import re
+
+        config = json.loads(self.config.read_text())
+        config.update(herdr_session='kpi-agg', management_chat_id='chat', admin_users=['user'])
+        self.config.write_text(json.dumps(config))
+        replies, calls = [], []
+        case = self
+
+        class OfflineTransport:
+            def __init__(self, credentials):
+                with case.assertRaises(entry.AlreadyRunning):
+                    with entry.InstanceLock(case.config):
+                        pass
+                case.assertTrue(Path(config['database']).exists())
+
+            def send(self, message, reply):
+                replies.append(reply)
+
+            def create_group(self, value):
+                calls.append(value)
+                case.assertFalse(self.is_stopping())
+                return GroupCreateResult('oc_runtime_fixture', True)
+
+            def start(self, runtime):
+                def emit(text, message_id):
+                    data = event(text, message_id, chat='chat', user='user', group=True)
+                    data['event']['message']['mentions'][0]['id']['open_id'] = config['bot_open_id']
+                    worker = runtime.receive(data)
+                    case.assertIsNotNone(worker)
+                    worker.join(5)
+                    case.assertFalse(worker.is_alive())
+                core = runtime.bridge.core
+                case.assertEqual(core.bot_open_id, config['bot_open_id'])
+                case.assertEqual(core.herdr.session, 'kpi-agg')
+                emit('/group-new runtime test', 'runtime-new')
+                code = re.search(r'g-[0-9a-f]{16}', replies[-1].text).group()
+                emit('/confirm ' + code, 'runtime-confirm')
+                case.assertEqual(replies[-1].code, 'group_created')
+                case.assertTrue(core.is_authorized(Message('probe', 'oc_runtime_fixture', 'user', '/agents', 101, 'group')))
+                case.assertNotIn('oc_runtime_fixture', core.allowed_chats)
+                runtime.stopping = True
+                case.assertTrue(self.is_stopping())
+                case.assertIsNone(runtime.receive(event('/group-new stopped', 'after-stop', group=True)))
+
+        with patch.object(entry.Path, 'home', return_value=self.root), \
+                patch.object(entry, 'LarkTransport', OfflineTransport), \
+                patch('feishu_herdr_bridge.herdr.subprocess.Popen') as cli:
+            self.assertEqual(entry.main(['--config', str(self.config)], env=self.credentials), 0)
+        cli.assert_not_called()
+        self.assertEqual(len(calls), 1)
