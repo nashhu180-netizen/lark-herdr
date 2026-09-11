@@ -282,19 +282,27 @@ class BridgeCore:
             return Reply("done", "cancelled" if cancelled else "nothing_to_cancel",
                          "已取消待执行请求。" if cancelled else "本会话没有待执行的创建请求。")
         if action == "agents":
-            agents = self.herdr.list_agents_with_workspace_labels()
+            agents = sorted(self.herdr.list_agents_with_workspace_labels(),
+                            key=lambda a: (a.workspace_id, a.pane_id))
+            if not agents:
+                return Reply("done", "agents", "当前 session 无 live Agent。")
             owners = self.store.owners(self.herdr.session)
-            lines = []
-            for agent in sorted(agents, key=lambda a: (a.workspace_id, a.pane_id)):
-                owner = owners.get(agent.workspace_id)
-                occupancy = "本会话" if owner == message.chat_id else ("已占用" if owner else "未绑定")
+            workspaces: dict[str, list[Agent]] = {}
+            for agent in agents:
+                workspaces.setdefault(agent.workspace_id, []).append(agent)
+            lines = [f"{len(workspaces)} 个 workspace / {len(agents)} 个 Pane/Agent："]
+            for workspace_id, members in workspaces.items():
                 lines.append(
-                    f"{agent.workspace_id} / {agent.pane_id} | "
-                    f"{agent.workspace_label or '(无 workspace 名称)'}"
-                    f" | {agent.name or '(无 Agent 名称)'}"
-                    f" | {agent.kind} | {agent.status or 'unknown'} | {occupancy}"
+                    f"{workspace_id} | {members[0].workspace_label or '(无 workspace 名称)'}"
                 )
-            return Reply("done", "agents", "\n".join(lines) or "当前 session 无 live Agent。")
+                owner = owners.get(workspace_id)
+                occupancy = "本会话" if owner == message.chat_id else ("已占用" if owner else "未绑定")
+                for agent in members:
+                    lines.append(
+                        f"  {agent.pane_id} | {agent.name or '(无 Agent 名称)'}"
+                        f" | {agent.kind} | {agent.status or 'unknown'} | {occupancy}"
+                    )
+            return Reply("done", "agents", "\n".join(lines))
         if action == "bind":
             workspace_id, pane_id = args
             if not safe_identifier(workspace_id) or not safe_identifier(pane_id):
