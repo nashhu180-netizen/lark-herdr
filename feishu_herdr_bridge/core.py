@@ -282,14 +282,16 @@ class BridgeCore:
             return Reply("done", "cancelled" if cancelled else "nothing_to_cancel",
                          "已取消待执行请求。" if cancelled else "本会话没有待执行的创建请求。")
         if action == "agents":
-            agents = self.herdr.list_agents()
+            agents = self.herdr.list_agents_with_workspace_labels()
             owners = self.store.owners(self.herdr.session)
             lines = []
             for agent in sorted(agents, key=lambda a: (a.workspace_id, a.pane_id)):
                 owner = owners.get(agent.workspace_id)
                 occupancy = "本会话" if owner == message.chat_id else ("已占用" if owner else "未绑定")
                 lines.append(
-                    f"{agent.workspace_id} / {agent.pane_id} | {agent.name or '(无名称)'}"
+                    f"{agent.workspace_id} / {agent.pane_id} | "
+                    f"{agent.workspace_label or '(无 workspace 名称)'}"
+                    f" | {agent.name or '(无 Agent 名称)'}"
                     f" | {agent.kind} | {agent.status or 'unknown'} | {occupancy}"
                 )
             return Reply("done", "agents", "\n".join(lines) or "当前 session 无 live Agent。")

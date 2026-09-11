@@ -42,7 +42,8 @@ class StaticCLI:
         command = list(command)
         assert command[:3] == ["/offline/herdr", "--session", self.session]
         args = command[3:]
-        action = "create" if args[:2] == ["workspace", "create"] else args[1]
+        action = ("workspace_list" if args[:2] == ["workspace", "list"] else
+                  "create" if args[:2] == ["workspace", "create"] else args[1])
         self.calls.append((action, args))
         mode = self.modes.get(action)
         if mode == "error":
@@ -50,6 +51,9 @@ class StaticCLI:
         if action == "list":
             assert args == ["agent", "list"]
             result = {"type": "agent_list", "agents": list(self.agents.values())}
+        elif action == "workspace_list":
+            assert args == ["workspace", "list"]
+            result = self.fixture["workspace_list"]["result"]
         elif action == "get":
             assert len(args) == 3
             agent = copy.deepcopy(self.agents[args[2]])

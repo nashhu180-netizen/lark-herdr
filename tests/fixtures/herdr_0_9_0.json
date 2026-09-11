@@ -39,6 +39,22 @@
       ]
     }
   },
+  "workspace_list": {
+    "id": "static-workspace_list",
+    "result": {
+      "type": "workspace_list",
+      "workspaces": [
+        {
+          "workspace_id": "workspace-a",
+          "label": "Project Alpha"
+        },
+        {
+          "workspace_id": "workspace-b",
+          "label": "项目乙"
+        }
+      ]
+    }
+  },
   "get": {
     "id": "static-agent_info",
     "result": {

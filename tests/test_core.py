@@ -282,6 +282,8 @@ class CoreTests(unittest.TestCase):
         text = self.send("/agents").text
         self.assertIn("workspace-a / pane-a", text)
         self.assertIn("workspace-b / pane-b", text)
+        self.assertIn("Project Alpha", text)
+        self.assertIn("项目乙", text)
         self.assertIn("本会话", text)
         self.assertIn("未绑定", text)
         self.assertIn("workspace-a / pane-a", self.send("/bind").text)

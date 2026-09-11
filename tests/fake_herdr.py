@@ -26,6 +26,10 @@ def decode_control(action, stdout):
         return ControlResult(error=obj["error"])
     if action in {"list", "get"}:
         return ControlResult(agents=tuple(Agent(**item) for item in obj["agents"]))
+    if action == "workspace_list":
+        return ControlResult(workspace_labels=tuple(
+            (item["workspace_id"], item["label"]) for item in obj["workspaces"]
+        ))
     return ControlResult()
 
 
@@ -35,6 +39,10 @@ class FakeHerdR:
         self.log_path = root / "fake-calls.jsonl"
         self.save({
             "sessions": {SESSION: {
+                "workspaces": {
+                    "workspace-a": "Project Alpha",
+                    "workspace-b": "项目乙",
+                },
                 "agents": {
                     "pane-a": {"workspace_id": "workspace-a", "pane_id": "pane-a",
                                "name": "lead-a", "kind": "codex", "status": "idle"},
@@ -89,6 +97,14 @@ def main() -> int:
         print(json.dumps({"contract": CONTRACT, "ok": ok, **fields}))
 
     record("call", argv=args)
+    if args == ["workspace", "list"]:
+        data = state["sessions"].get(session)
+        if data is None:
+            output(False, error="target_missing")
+            return 2
+        output(workspaces=[{"workspace_id": key, "label": value}
+                           for key, value in data["workspaces"].items()])
+        return 0
     if len(args) < 2 or args[0] != "agent":
         output(False, error="rejected")
         return 2
