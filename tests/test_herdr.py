@@ -40,8 +40,9 @@ class AdapterTests(unittest.TestCase):
 
         def runner(command, timeout):
             commands.append((list(command), timeout))
+            field = "workspaces" if tuple(command[-2:]) == ("workspace", "list") else "agents"
             return subprocess.CompletedProcess(command, 0, json.dumps({
-                "contract": CONTRACT, "ok": True, "agents": [],
+                "contract": CONTRACT, "ok": True, field: [],
             }), "")
 
         adapter = HerdrAdapter(SESSION, command_builder=builder,
@@ -74,6 +75,13 @@ class AdapterTests(unittest.TestCase):
     def test_malformed_control_output_is_not_guessed(self):
         self.fake.mode("list", "malformed")
         self.assert_error("invalid_output", self.adapter.list_agents, uncertain=False)
+
+    def test_workspace_labels_are_joined_by_explicit_workspace_id(self):
+        agents = self.adapter.list_agents_with_labels()
+        self.assertEqual([(agent.workspace_id, agent.workspace_label) for agent in agents],
+                         [("workspace-a", "Project Alpha"), ("workspace-b", "项目乙")])
+        self.assertEqual([(agent.tab_id, agent.tab_label) for agent in agents],
+                         [("tab-a", "主控"), ("tab-b", "Review B")])
 
     def test_duplicate_panes_in_list_are_rejected(self):
         state = self.fake.load()
@@ -166,7 +174,9 @@ class Protocol22Tests(unittest.TestCase):
         def runner(command, timeout):
             self.calls.append(list(command))
             args = command[3:]
-            action = "create" if args[:2] == ("workspace", "create") else args[1]
+            action = ("workspace_list" if args[:2] == ("workspace", "list") else
+                      "tab_list" if args[:2] == ("tab", "list") else
+                      "create" if args[:2] == ("workspace", "create") else args[1])
             output = self.fixture["read_text"] if action == "read" else json.dumps(self.fixture[action])
             return subprocess.CompletedProcess(command, 0, output, "")
 
@@ -179,7 +189,11 @@ class Protocol22Tests(unittest.TestCase):
         self.assertEqual(self.fixture["_meta"]["live_probe"], "pending")
 
     def test_all_configured_commands_have_explicit_session_and_confirmed_options(self):
-        self.assertEqual(self.adapter.list_agents()[0].kind, "codex")
+        agents = self.adapter.list_agents_with_labels()
+        self.assertEqual(agents[0].kind, "codex")
+        self.assertEqual([agent.workspace_label for agent in agents], ["Project Alpha", "项目乙"])
+        self.assertEqual([(agent.tab_id, agent.tab_label) for agent in agents],
+                         [("tab-a", "主控"), ("tab-b", "Review B")])
         self.assertEqual(self.adapter.get_agent("pane-a").workspace_id, "workspace-a")
         self.assertEqual(self.adapter.read_agent("pane-a"), self.fixture["read_text"])
         self.adapter.prompt("pane-a", "中文\nsecond line")
@@ -190,6 +204,8 @@ class Protocol22Tests(unittest.TestCase):
         prefix = ["/configured/herdr", "--session", "explicit-session"]
         self.assertEqual(self.calls, [
             prefix + ["agent", "list"],
+            prefix + ["workspace", "list"],
+            prefix + ["tab", "list"],
             prefix + ["agent", "get", "pane-a"],
             prefix + ["agent", "read", "pane-a", "--source", "visible", "--lines", "80", "--format", "text"],
             prefix + ["agent", "prompt", "pane-a", "中文\nsecond line"],

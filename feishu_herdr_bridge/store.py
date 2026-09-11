@@ -9,6 +9,32 @@ from pathlib import Path
 from typing import Iterator
 
 
+class SchemaMismatch(RuntimeError):
+    """Unknown versions or conflicting schemas must not be repaired implicitly."""
+
+
+@dataclass(frozen=True, repr=False)
+class GroupRequest:
+    request_id: str
+    confirmation_code: str
+    source_chat_id: str
+    requested_by: str
+    group_name: str
+    create_uuid: str
+    herdr_session: str
+    bot_open_id: str
+    created_chat_id: str | None
+    status: str
+    result_code: str
+    expires_at: float
+    created_at: float
+    updated_at: float
+
+    @property
+    def reference(self) -> str:
+        return f"G-{self.create_uuid}"
+
+
 class BindingChanged(Exception):
     """The caller's binding snapshot is no longer current."""
 
@@ -126,14 +152,60 @@ CREATE TABLE IF NOT EXISTS create_requests (
 """
 
 
+_GROUP_SCHEMA = """
+CREATE TABLE group_requests (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    confirmation_code TEXT NOT NULL UNIQUE,
+    source_chat_id TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    create_uuid TEXT NOT NULL UNIQUE,
+    herdr_session TEXT NOT NULL CHECK (herdr_session = 'kpi-agg'),
+    bot_open_id TEXT NOT NULL,
+    created_chat_id TEXT UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('pending','processing','done','failed','unknown')),
+    result_code TEXT NOT NULL DEFAULT '',
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    CHECK (status <> 'done' OR (created_chat_id IS NOT NULL AND length(created_chat_id) > 0))
+);
+"""
+
+
+def _schema_definitions(sql: str) -> dict[str, str]:
+    # Only our fixed DDL is accepted, including its constraints. No repair engine.
+    statements = (part.strip() for part in sql.split(";") if part.strip())
+    normalized = (" ".join(part.replace("IF NOT EXISTS ", "").split()) for part in statements)
+    return {part.split()[2]: part for part in normalized}
+
+
 class Store:
     def __init__(self, path: str | Path) -> None:
         if str(path) == ":memory:":
             raise ValueError("Use a file-backed database, including in tests")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connection() as db:
-            db.executescript(_SCHEMA)
+        with self._transaction() as db:
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version not in (0, 1):
+                raise SchemaMismatch("Unsupported database version")
+            expected = _schema_definitions(_SCHEMA + (_GROUP_SCHEMA if version == 1 else ""))
+            actual = dict(db.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall())
+            if actual or version == 1:
+                normalized = {name: next(iter(_schema_definitions(sql).values())) for name, sql in actual.items()}
+                if normalized != expected:
+                    raise SchemaMismatch("Conflicting database schema")
+            else:
+                for statement in _SCHEMA.split(";"):
+                    if statement.strip():
+                        db.execute(statement)
+            if version == 0:
+                # execute(), not executescript(): DDL and version advance commit together.
+                db.execute(_GROUP_SCHEMA)
+                db.execute("PRAGMA user_version=1")
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -293,6 +365,10 @@ class Store:
                    result_code='interrupted', updated_at=? WHERE status='processing'""",
                 (now,),
             )
+            db.execute(
+                """UPDATE group_requests SET status='unknown',
+                   result_code='interrupted', updated_at=? WHERE status='processing'""", (now,),
+            )
 
     def propose_creation(self, creation: Creation) -> None:
         with self._transaction() as db:
@@ -402,3 +478,97 @@ class Store:
                    updated_at=? WHERE request_id=?""", (now, request_id),
             )
             return binding
+
+
+    def propose_group(self, group: GroupRequest) -> None:
+        if group.status != "pending" or group.created_chat_id is not None:
+            raise ValueError("Only pending group proposals may be inserted")
+        with self._transaction() as db:
+            db.execute(
+                """UPDATE group_requests SET status='failed', result_code='superseded', updated_at=?
+                   WHERE source_chat_id=? AND requested_by=? AND status='pending'""",
+                (group.created_at, group.source_chat_id, group.requested_by),
+            )
+            db.execute(
+                "INSERT INTO group_requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                tuple(getattr(group, field) for field in GroupRequest.__dataclass_fields__),
+            )
+
+    def find_group(self, code: str, chat_id: str, user_id: str, session: str, bot_id: str) -> GroupRequest | None:
+        with self._connection() as db:
+            row = db.execute(
+                """SELECT * FROM group_requests WHERE confirmation_code=? AND source_chat_id=?
+                   AND requested_by=? AND herdr_session=? AND bot_open_id=?""",
+                (code, chat_id, user_id, session, bot_id),
+            ).fetchone()
+            return GroupRequest(**dict(row)) if row else None
+
+    def group_allowed(self, chat_id: str, session: str, bot_id: str) -> bool:
+        with self._connection() as db:
+            return db.execute(
+                """SELECT 1 FROM group_requests WHERE created_chat_id=? AND status='done'
+                   AND herdr_session='kpi-agg' AND herdr_session=? AND bot_open_id=?""",
+                (chat_id, session, bot_id),
+            ).fetchone() is not None
+
+    def begin_group(self, group: GroupRequest, now: float) -> GroupRequest:
+        with self._transaction() as db:
+            expired = now >= group.expires_at
+            cursor = db.execute(
+                """UPDATE group_requests SET status=?, result_code=?, updated_at=?
+                   WHERE request_id=? AND confirmation_code=? AND source_chat_id=?
+                   AND requested_by=? AND herdr_session=? AND bot_open_id=?
+                   AND expires_at=? AND status='pending'""",
+                ("failed" if expired else "processing", "expired" if expired else "", now,
+                 group.request_id, group.confirmation_code, group.source_chat_id, group.requested_by,
+                 group.herdr_session, group.bot_open_id, group.expires_at),
+            )
+            if cursor.rowcount != 1:
+                raise CreationRejected("confirmation_used")
+            row = db.execute("SELECT * FROM group_requests WHERE request_id=?", (group.request_id,)).fetchone()
+            return GroupRequest(**dict(row))
+
+    def save_group_resource(self, request_id: str, chat_id: str, now: float) -> None:
+        if not isinstance(chat_id, str) or not chat_id:
+            raise ValueError("A known group ID is required")
+        with self._connection() as db:
+            cursor = db.execute(
+                """UPDATE group_requests SET created_chat_id=?, updated_at=?
+                   WHERE request_id=? AND status='processing'
+                   AND (created_chat_id IS NULL OR created_chat_id=?)""", (chat_id, now, request_id, chat_id),
+            )
+            if cursor.rowcount != 1:
+                raise CreationRejected("confirmation_used")
+
+    def complete_group(self, request_id: str, now: float) -> GroupRequest:
+        with self._transaction() as db:
+            cursor = db.execute(
+                """UPDATE group_requests SET status='done', result_code='created', updated_at=?
+                   WHERE request_id=? AND status='processing'""", (now, request_id),
+            )
+            if cursor.rowcount != 1:
+                raise CreationRejected("confirmation_used")
+            row = db.execute("SELECT * FROM group_requests WHERE request_id=?", (request_id,)).fetchone()
+            return GroupRequest(**dict(row))
+
+    def finish_group(self, request_id: str, status: str, code: str, now: float) -> None:
+        if status not in {"failed", "unknown"}:
+            raise ValueError("Use complete_group for success")
+        with self._connection() as db:
+            # Consumption can fail before commit. Atomically retire its pending
+            # code on uncertainty too; never overwrite an existing terminal result.
+            db.execute(
+                """UPDATE group_requests SET status=?, result_code=?, updated_at=?
+                   WHERE request_id=? AND
+                   (status='processing' OR (status='pending' AND ?='unknown'))""",
+                (status, code, now, request_id, status),
+            )
+
+    def cancel_group(self, chat_id: str, user_id: str, session: str, bot_id: str, now: float) -> bool:
+        with self._connection() as db:
+            cursor = db.execute(
+                """UPDATE group_requests SET status='failed', result_code='cancelled', updated_at=?
+                   WHERE source_chat_id=? AND requested_by=? AND herdr_session=? AND bot_open_id=?
+                   AND status='pending'""", (now, chat_id, user_id, session, bot_id),
+            )
+            return cursor.rowcount > 0

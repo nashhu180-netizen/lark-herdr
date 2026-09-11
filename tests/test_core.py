@@ -280,8 +280,12 @@ class CoreTests(unittest.TestCase):
     def test_agents_and_binding_display_are_target_aware(self):
         self.bind()
         text = self.send("/agents").text
-        self.assertIn("workspace-a / pane-a", text)
-        self.assertIn("workspace-b / pane-b", text)
+        self.assertIn("Workspace（2）：", text)
+        self.assertIn("Pane/Agent（2）：", text)
+        self.assertIn("- workspace-a | Project Alpha", text)
+        self.assertIn("  pane-a | Tab: 主控 | Agent: lead-a", text)
+        self.assertIn("workspace-b | 项目乙", text)
+        self.assertEqual(text.count("workspace-a | Project Alpha"), 2)
         self.assertIn("本会话", text)
         self.assertIn("未绑定", text)
         self.assertIn("workspace-a / pane-a", self.send("/bind").text)
@@ -342,3 +346,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.core.execute(prepared).code, "binding_changed")
         self.assertFalse(self.lock.locked())
         self.assertEqual(self.fake.events("submitted"), [])
+
+    def test_legacy_message_constructor_and_unconfigured_group_gate(self):
+        message = self.message('/agents')
+        self.assertIsNone(message.chat_type)
+        self.assertTrue(self.core.is_authorized(message))
+        self.assertEqual(self.core.handle(message).code, 'agents')
+        before = len(self.fake.events())
+        self.assertEqual(self.send('/group-new private').code, 'forbidden')
+        self.assertEqual(self.send('/confirm g-' + 'a' * 16).code, 'forbidden')
+        self.assertEqual(len(self.fake.events()), before)
+
+    def test_revoked_user_is_rechecked_before_prepared_work_executes(self):
+        self.bind()
+        prepared = self.core.prepare(self.message('no longer authorized'))
+        self.core.allowed_users = frozenset()
+        self.assertEqual(self.core.execute(prepared).code, 'forbidden')
+        self.assertEqual(self.fake.events('submitted'), [])
+        self.assertFalse(self.lock.locked())

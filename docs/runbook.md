@@ -1,16 +1,16 @@
 # Linux 运行与恢复
 
-编写时间：2026-09-11。范围：Batch 3；设计以 `docs/design.md` 为准。
+修订时间：2026-09-11。范围：核心 MVP 与 Issue #3 的 Batch G3 操作说明；设计以 `docs/design.md` 为准。
 
-HerdR 与飞书的 Linux 核心 MVP 冒烟已于 2026-09-11 通过，逐项结果和剩余未测边界见 `docs/live-validation.md`。protocol-22 fixture 来自静态 schema，不能替代该真实证据。保留本地审核已修正的 `workspace.workspace_id`、`tab.tab_id`、`root_pane.pane_id` 及非零 CLI 从 stderr 解析结构化错误的契约。
+既有 Linux 核心 MVP 冒烟使用 `lark-herdr-test`，历史结果保留在 `docs/live-validation.md`。本轮基线为 `ec1f6e1`，G2 的固定 SDK 离线测试已由本地审核通过；自助建群、部署切到 `kpi-agg` 及只命中该 session 的真实验收均未测，另记录在 `docs/self-service-groups-validation.md`。静态 schema、fake 测试和历史冒烟不能替代本轮真实证据。保留 protocol-22 的精确 ID 字段及 stderr 错误解析，不在文档批次修改实现。
 
 ## 1. 前置条件与离线检查
 
 使用原生 Linux、Python 3.11+，以运行 HerdR 的同一普通用户操作。预先完成 Codex、Claude 登录及首次初始化；用户手动建群或打开私聊、加入机器人、配置飞书收发权限及长连接事件 `im.message.receive_v1`。
 
-当前本地协调进程没有 `HERDR_ENV=1`，不得从该进程读取或控制现有 session。下文所有真实启动、查询和写入必须由用户在符合本机 HerdR 规范的合法上下文执行。不得手工设置 `HERDR_ENV=1` 冒充 Pane 上下文。用户服务访问预启动 session 的方式也须先获得本机规范允许；未确认前只安装文件和运行离线测试，不启动服务。
+没有 `HERDR_ENV=1` 的协调进程不得读取或控制现有 session。下文所有真实启动、查询和写入必须由用户在符合本机 HerdR 规范的合法上下文执行。不得手工设置 `HERDR_ENV=1` 冒充 Pane 上下文。用户服务访问预启动 session 的方式也须先获得本机规范允许；未确认前只安装文件和运行离线测试，不启动服务。
 
-在仓库根目录执行。依赖安装可能访问包源，测试本身不需要凭据或网络；已有离线 wheel/依赖时按本地环境安装，不变更精确依赖 `lark-oapi==1.7.3`。
+已有服务升级须先按 2.2 停服、备份，再更新部署代码或环境；不要让新版本先打开原数据库。新安装无需旧库迁移。以下在仓库根目录执行：依赖安装可能访问包源，测试本身不需要凭据或网络；已有离线 wheel/依赖时按本地环境安装，不变更精确依赖 `lark-oapi==1.7.3`。
 
     python3 -m venv .venv
     .venv/bin/python -m pip install -e .
@@ -33,7 +33,7 @@ HerdR 与飞书的 Linux 核心 MVP 冒烟已于 2026-09-11 通过，逐项结�
     test ! -e "$HOME/.config/feishu-herdr-bridge/credentials.env" && \
       install -m 600 examples/credentials.env.example "$HOME/.config/feishu-herdr-bridge/credentials.env"
 
-本地编辑私有副本，填写真实的 HerdR 绝对可执行路径、明确 session、机器人 `open_id`、操作者及会话白名单、允许创建的项目绝对目录。项目别名用于 `/new`。配置 JSON 不插值 `~`、环境变量或 systemd 的 `%h`。
+本地编辑私有副本，填写真实的 HerdR 绝对可执行路径、机器人 `open_id`、操作者及会话白名单、允许创建的项目绝对目录。示例固定 `herdr_session="kpi-agg"`，以 `management_chat_id=null`、`admin_users=[]` 默认关闭建群；其余占位值也须替换。项目别名用于 `/new`。配置 JSON 不插值 `~`、环境变量或 systemd 的 `%h`。
 
 密钥只写入私有 `credentials.env`。使用 systemd `EnvironmentFile` 支持的赋值格式；需要时引用值，不使用 `export`、命令替换或变量展开。不要 `cat` 凭据、开启 shell trace、将凭据粘贴到日志或仓库。
 
@@ -42,6 +42,46 @@ HerdR 与飞书的 Linux 核心 MVP 冒烟已于 2026-09-11 通过，逐项结�
     stat -c '%a %n' "$HOME/.config/feishu-herdr-bridge/"{config.json,credentials.env}
 
 省略 `database` 时默认使用 `~/.local/state/feishu-herdr-bridge/bridge.sqlite3`。自定义数据库路径必须为仓库外绝对路径，父目录权限 `0700`，文件权限 `0600`。服务的 `UMask=0077` 保护新建文件。
+
+### 2.1 一次可信管理群初始化
+
+由用户手动创建或选择一个可信管理群，加入现有应用的机器人。核对群的真实 ID、机器人 `bot_open_id` 与当前 `FEISHU_APP_ID` 属于同一应用；管理员 ID 使用该应用的用户 `open_id`。真实 ID 仅填私有配置，不写入仓库或公开验收材料。
+
+在原应用中启用机器人能力，保留已有消息收发和事件权限，并申请 `im:chat:create`。权限变更须完成应用版本发布及租户所需审批，实际可用范围须覆盖请求管理员；仅在开发后台勾选权限不等于已生效。沿用应用 tenant 身份，不配置用户 OAuth，不新建另一机器人，也不以手动补拉成员代替建群验收。API 边界及依据见 `docs/design.md` 10.5。
+
+启用时同时填写 `management_chat_id` 与非空 `admin_users`：管理群必须已在静态 `allowed_chats`，管理员必须全部属于 `allowed_users`，session 必须为 `kpi-agg`。群主或飞书群管理员身份不授予桥接管理员权限。半配置、非白名单管理群、管理员越出用户白名单或启用时 session 错误，均停止启动，不猜默认值。
+
+旧配置同时省略两项时继续原有功能；显式 `null` 与空列表也关闭建群。只填写其中一项不合法。关闭建群入口不删除已完成受管群；它们仍须匹配当前 `kpi-agg`、机器人身份和用户白名单。不要通过改机器人 ID 认领其他应用的群。切换旧部署的 session 不会迁移旧绑定；旧 session 绑定须人工核对后重新绑定，不能直接改数据库里的 session 字段。
+
+上述应用权限与管理配置只需初始化一次，并在部署时重启。后续正常建群不改配置、不重启，也不把新群 ID 追加进 `allowed_chats`。
+
+### 2.2 旧实例停服、备份与迁移
+
+下面是供本地操作者执行的旧实例备份步骤，不是配置校验或 dry-run。先核实当前服务使用的数据库路径；如配置了 `database`，将 `DB` 改成该绝对路径。新安装没有旧库时跳过备份，不通过创建空库替代已有数据。确保没有其他进程写同一数据库，任一步失败即停止，不继续部署。
+
+    (
+      set -eu
+      umask 077
+      CFG="$HOME/.config/feishu-herdr-bridge/config.json"
+      DB="$HOME/.local/state/feishu-herdr-bridge/bridge.sqlite3"
+      systemctl --user stop feishu-herdr-bridge.service
+      test "$(systemctl --user show feishu-herdr-bridge.service -p ActiveState --value)" = inactive
+      test -f "$CFG"
+      test -f "$DB"
+      install -d -m 700 "$HOME/.local/state/feishu-herdr-bridge"
+      BACKUP="$(mktemp -d "$HOME/.local/state/feishu-herdr-bridge/backup-XXXXXXXX")"
+      install -m 600 "$CFG" "$BACKUP/config.json"
+      for FILE in "$DB" "$DB-wal" "$DB-shm" "$DB-journal"; do
+        if [ -f "$FILE" ]; then install -m 600 "$FILE" "$BACKUP/"; fi
+      done
+      printf '%s\n' "$BACKUP"
+    )
+
+私下记录原运行提交和备份目录；不要把刚拉取的工作树提交误记为原运行版本。备份保持目录 `0700`、文件 `0600`，不入仓库。保留原凭据文件的 `0600` 权限，不输出其内容。
+
+本轮只新增 `group_requests`。启动时在实例锁内迁移：旧库 `user_version=0` 一次事务建表并升为 1；版本 1 核验结构，不重复迁移。未知版本、表结构或约束冲突会停止启动，不自动修库。`done` 必须有非空 `created_chat_id`、群 ID 唯一等约束在数据库中执行，原三表及数据保留。启动程序会打开数据库并连接 SDK，不能将它当作无副作用的校验命令。
+
+迁移失败时停住服务以中止自动重启，保留原库、备份和脱敏日志，交本地 Codex 核查。不得删表、重置 `user_version` 或删除数据库重建。若部署后可能发生过远端写，不能直接恢复写前备份再启动；旧备份可能丢失已消费确认码和受管群记录，须先核对远端与最新本地状态，再审核恢复步骤。
 
 ## 3. 安装用户服务模板
 
@@ -74,7 +114,7 @@ HerdR 与飞书的 Linux 核心 MVP 冒烟已于 2026-09-11 通过，逐项结�
 
 ## 4. 真实启动与日常使用
 
-先通过 HerdR 自身的受支持方式启动配置指定的 session，再按 `docs/live-validation.md` 记录实际 session、workspace 和 Pane。桥接不会启动或重启 HerdR server。
+在合法上下文通过 HerdR 自身受支持的方式预启动 `kpi-agg`。本轮只使用该 session 内经授权的测试 workspace，不切到 `lark-herdr-test` 代替验收，也不通过群命令选择 session。桥接不会启动或重启 HerdR server。按 `docs/self-service-groups-validation.md` 记录本轮结果，旧 `docs/live-validation.md` 不改写。
 
 确认本机权限边界、私有配置和依赖均已就绪后，由合法操作者执行：
 
@@ -84,7 +124,22 @@ HerdR 与飞书的 Linux 核心 MVP 冒烟已于 2026-09-11 通过，逐项结�
 
 在白名单群内 @ 机器人后依次使用 `/agents`、`/bind <workspace_id> <pane_id>`。收到绑定成功回执再发普通文本；`/read` 查看当前画面。新任务使用 `/new <项目别名> <codex或claude>`，核对目录和换绑目标，再由原发起人在同一会话发送 `/confirm <确认码>`。
 
-群消息必须使用飞书选择出的真实 @ mention，手工输入看起来相同的纯文本 `@机器人` 不会进入桥接。群可由用户手工创建，也可用官方 `lark-cli` 创建；桥接本身不负责建群。
+群消息必须使用飞书选择出的真实 @ mention，手工输入同形文本不会进入桥接。管理群可以不绑定 workspace，建群动作不应调用 HerdR。
+
+仅当前配置管理员在管理群 @ 机器人发送 `/group-new <群名>`；群名为 1～60 个字符，可有内部空格，不能含换行或控制字符。核对提案的群名、固定 session 和 `G-<UUID>` 参考号，再由同一管理员于 5 分钟内在同一管理群发送 `/confirm g-<确认码后缀>`。必须使用机器人返回的实际码，不能照抄占位符。
+
+预期请求者成为群主，现有机器人按创建契约自动入群。成功回执只返回群名和稳定参考号；本轮不取分享链接、不回显真实群 ID。须在客户端核对请求者、机器人和内部私密群属性；不符时停止并人工核查，不能补加成员后把原建群流程记为通过。
+
+授权落库为 `done` 后，新群立即可 @ 机器人使用 `/agents`、`/bind`、`/new`、`/confirm`、`/cancel`、`/read` 及普通文本。初始没有绑定，普通文本会提示先绑定；新群不继承管理群绑定。成员仍须在 `allowed_users` 中，管理员在新群也不能执行 `/group-new`。仅把机器人拉进陌生群不会产生授权。
+
+`/new` 只替换本会话的 workspace 提案；`/group-new` 只替换本管理群内当前管理员自己的建群提案，两类 pending 可同时存在。`/cancel` 保持原 workspace 取消语义，对建群只允许当前仍获授权的原请求管理员在管理群取消自己的 pending，不能取消他人的或已消费的请求。
+
+首次部署启动后、开始建群前，在本地记录服务实例和配置摘要：
+
+    systemctl --user show feishu-herdr-bridge.service -p MainPID -p InvocationID
+    sha256sum "$HOME/.config/feishu-herdr-bridge/config.json"
+
+完成两群即时准入测试后再次比较，期间不编辑配置、不重启服务、不手工写入授权表。公开材料只保留服务实例、摘要和群的脱敏代号；发生自动重启也必须如实记录，不能据此宣称完成了不重启准入验证。
 
 Codex 或 Claude 首次在新 Pane 启动时，可能被信任目录、登录或首次运行界面阻塞。此时 `/confirm` 可能返回 `remote_error`，同时报告已保留的 workspace/Pane；这是“结果不明”，不是可自动重试错误。打开该 Pane 人工处理阻塞，再用 `/agents` 核对 Agent 已为 idle，最后执行 `/bind <workspace_id> <pane_id>`。不要复用原确认码，也不要在检查现场前重新 `/new`。
 
@@ -102,7 +157,7 @@ CLI 被终止不能撤销已经提交给 HerdR 的操作。未确认结果的中
 
 锁位于 `~/.local/state/feishu-herdr-bridge/locks/<规范配置路径的哈希>.lock`，在 SQLite 恢复和 SDK 构造前取得。相同路径及指向它的符号链接不能双开，重复实例退出码为 3。文件保留是正常现象，进程退出后内核释放锁；不得通过删锁文件绕过仍在运行的实例。不要复制配置指向同一数据库以绕过单实例边界。
 
-遇到 `unknown`、创建部分失败、绑定失效或回执缺失，先由合法操作者核对对应 workspace/Pane 的真实现场。已创建资源和旧绑定保留；没有确认创建成功时，不假定创建请求已回滚。不要删除幂等记录、把状态手动改回 `processing` 或重复使用确认码。
+workspace 操作遇到 `unknown`、创建部分失败、绑定失效或回执缺失时，先由合法操作者核对对应 workspace/Pane 的真实现场。已创建资源和旧绑定保留；没有确认成功时，不假定创建请求已回滚。不要删除幂等记录、把状态改回 `pending/processing` 或重复执行原 workspace 确认。建群异常按下节单独处理。
 
 确认现场后重新 `/bind`，仅将确实需要执行的工作作为新消息提交。原创建请求不可续跑，确需另建时重新 `/new`。重启桥接使用：
 
@@ -111,4 +166,16 @@ CLI 被终止不能撤销已经提交给 HerdR 的操作。未确认结果的中
 
 恢复前不要删除数据库。需要备份时先停服务，再复制数据库及存在的 SQLite 辅助文件到受限目录。日志和验收证据先脱敏；不提交真实终端正文、凭据或公司项目内容。
 
-服务 active 只说明进程存活。MVP 交付须另有 `docs/live-validation.md` 的逐项真实结果，未测项保持未测。
+### 5.1 建群 unknown、回执缺失与部分成功
+
+建群 POST 至多发送一次；在途 SDK/HTTP 写无法撤回。停止入口会拒绝尚未开始的 POST，但超时、取消本地等待或停止服务都不能证明飞书未建群。在途结果不明按 `unknown` 处理，能保存的资源 ID 留在私有库；来不及写回的 `processing` 在下次启动转为 `unknown`，不自动重试。
+
+仅 `group_requests.status=done` 启用动态群。若群已创建但其余返回字段无法确认，或保存资源/授权事务失败，保留已知资源且不作内存授权；整个数据库不可写时，甚至可能无法保存真实群 ID。不得将这个群按名称认领、手工追加静态白名单绕过审核、删除幂等记录、把状态退回 pending、复用 UUID 重新 POST，或在未排除重复资源前重新 `/group-new`。
+
+已知确认码被消费后，原请求管理员仍获授权且处于管理群时，可再发送同一 `/confirm g-...` 只读核对保存的状态和参考号，不发起第二次创建。若第一次完全没有回执且不知是否消费，不能假定确认只读；先人工核对，禁止凭群名推断成功。`done` 已提交但回执或消息级记账失败时，群仍保持启用，不撤销授权或重建。
+
+人工核查使用原提案的 `G-<UUID>`、群描述中的相同参考号，以及私有数据库已知的资源 ID、发起人、机器人和 session 记录交叉确认。参考号用于定位，不是授权凭证。仅群名相同不能证明资源归属。无法确认时保留 `unknown`，不扫描认领同名群；若需窄修原记录，先停相关操作并备份，由本地 Codex 审核，不能提供可重复执行远端写的恢复入口。
+
+日志不得记录真实 chat/user/message ID、密钥、token、确认码、群名、原始异常或 API 响应；测试样本仅用合成值，公开截图须遮盖真实值。群名和实际确认码只在必要的授权会话回执中展示，不复制到公开证据。不要开启 SDK DEBUG 或原始 HTTP 日志排查。危险故障只引用已有离线注入测试，不在真实服务中制造落库失败、断网或中断 POST。
+
+服务 active 只说明进程存活。本轮交付须由本地 Codex 填写 `docs/self-service-groups-validation.md` 的真实结果；未测项保持未测。文档补丁本身不构成真实飞书建群或 `kpi-agg` 验收通过。

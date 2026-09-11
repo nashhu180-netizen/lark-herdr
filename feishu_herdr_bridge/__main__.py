@@ -134,12 +134,14 @@ class Config:
     database: Path
     query_timeout: float
     write_timeout: float
+    management_chat_id: str | None = None
+    admin_users: frozenset[str] = frozenset()
 
 
 def load_config(path: Path) -> Config:
     raw = json.loads(path.read_text(encoding="utf-8"))
     required = {"herdr_executable", "herdr_session", "bot_open_id", "allowed_users", "allowed_chats", "projects"}
-    optional = {"database", "query_timeout", "write_timeout"}
+    optional = {"database", "query_timeout", "write_timeout", "management_chat_id", "admin_users"}
     if not isinstance(raw, dict) or not required <= raw.keys() or raw.keys() - required - optional:
         raise ValueError("Invalid configuration keys; credentials must be supplied through the environment")
     executable, session = raw["herdr_executable"], raw["herdr_session"]
@@ -149,6 +151,15 @@ def load_config(path: Path) -> Config:
     for key in ("allowed_users", "allowed_chats"):
         if not isinstance(raw[key], list) or not raw[key] or not all(safe_identifier(v) for v in raw[key]):
             raise ValueError("Nonempty user and chat allowlists are required")
+    management = raw.get("management_chat_id")
+    admins = raw.get("admin_users", [])
+    if (("management_chat_id" in raw) != ("admin_users" in raw)
+            or not isinstance(admins, list) or not all(safe_identifier(v) for v in admins)):
+        raise ValueError("Management configuration must be complete")
+    if management is not None or admins:
+        if (not safe_identifier(management) or management not in raw["allowed_chats"]
+                or not admins or not set(admins) <= set(raw["allowed_users"]) or session != "kpi-agg"):
+            raise ValueError("Invalid management group authorization")
     projects = raw["projects"]
     if not isinstance(projects, dict) or not all(
         safe_identifier(alias) and isinstance(directory, str) and Path(directory).is_absolute()
@@ -162,7 +173,8 @@ def load_config(path: Path) -> Config:
     if any(type(t) not in (int, float) or not math.isfinite(t) or t <= 0 for t in timeouts):
         raise ValueError("Timeouts must be finite positive numbers")
     return Config(executable, session, raw["bot_open_id"], frozenset(raw["allowed_users"]),
-                  frozenset(raw["allowed_chats"]), projects, Path(database), *timeouts)
+                  frozenset(raw["allowed_chats"]), projects, Path(database), *timeouts,
+                  management, frozenset(admins))
 
 
 def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None) -> int:
@@ -183,10 +195,15 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None)
                 adapter = HerdrAdapter(config.session, command_builder=session_command(config.executable),
                                        decoder=decode_protocol22, runner=runner,
                                        query_timeout=config.query_timeout, write_timeout=config.write_timeout)
-                core = BridgeCore(Store(config.database), adapter, allowed_users=config.users,
-                                  allowed_chats=config.chats, projects=config.projects)
+                store = Store(config.database)
                 transport = LarkTransport(credentials)
+                core = BridgeCore(store, adapter, allowed_users=config.users,
+                                  allowed_chats=config.chats, projects=config.projects,
+                                  management_chat_id=config.management_chat_id, admin_users=config.admin_users,
+                                  bot_open_id=config.bot_open_id,
+                                  create_group=transport.create_group if config.management_chat_id is not None else None)
                 runtime = BridgeRuntime(core, config.bot_open_id, transport.send, runner)
+                transport.is_stopping = lambda: runtime.stopping
                 with shutdown_signals(runtime):
                     try:
                         logging.getLogger(__name__).warning("HerdR contract=static-not-live; live validation pending")

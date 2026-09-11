@@ -13,7 +13,7 @@ import re
 import subprocess
 import threading
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -25,6 +25,9 @@ class Agent:
     name: str | None
     kind: str
     status: str | None = None
+    tab_id: str | None = None
+    workspace_label: str | None = None
+    tab_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,8 @@ class ControlResult:
     agents: tuple[Agent, ...] = ()
     error: str | None = None
     workspace: Workspace | None = None
+    workspace_labels: tuple[tuple[str, str], ...] = ()
+    tab_labels: tuple[tuple[str, str], ...] = ()
 
 
 class HerdrError(Exception):
@@ -216,11 +221,26 @@ class HerdrAdapter:
                         or not safe_identifier(agent.workspace_id)
                         or not safe_identifier(agent.pane_id)
                         or not safe_identifier(agent.kind)
+                        or (agent.tab_id is not None and not safe_identifier(agent.tab_id))
                         or (agent.name is not None and not safe_identifier(agent.name))
                         or (agent.status is not None and not safe_identifier(agent.status))
                         or agent.pane_id in seen):
                     raise ValueError("Invalid or duplicate agent")
                 seen.add(agent.pane_id)
+            workspace_ids: set[str] = set()
+            for workspace_id, label in result.workspace_labels:
+                if (not safe_identifier(workspace_id) or not isinstance(label, str)
+                        or not label.strip() or not safe_text(label) or "\n" in label
+                        or workspace_id in workspace_ids):
+                    raise ValueError("Invalid workspace label")
+                workspace_ids.add(workspace_id)
+            tab_ids: set[str] = set()
+            for tab_id, label in result.tab_labels:
+                if (not safe_identifier(tab_id) or not isinstance(label, str)
+                        or not label.strip() or not safe_text(label) or "\n" in label
+                        or tab_id in tab_ids):
+                    raise ValueError("Invalid tab label")
+                tab_ids.add(tab_id)
             if result.workspace is not None and (
                 not isinstance(result.workspace, Workspace) or not all(safe_identifier(v) for v in (
                     result.workspace.workspace_id, result.workspace.tab_id, result.workspace.pane_id
@@ -236,6 +256,17 @@ class HerdrAdapter:
     def list_agents(self) -> tuple[Agent, ...]:
         process = self._run(("agent", "list"))
         return self._decode("list", process, writing=False).agents
+
+    def list_agents_with_labels(self) -> tuple[Agent, ...]:
+        agents = self.list_agents()
+        workspace_process = self._run(("workspace", "list"))
+        labels = dict(self._decode("workspace_list", workspace_process,
+                                   writing=False).workspace_labels)
+        tab_process = self._run(("tab", "list"))
+        tab_labels = dict(self._decode("tab_list", tab_process, writing=False).tab_labels)
+        return tuple(replace(agent, workspace_label=labels.get(agent.workspace_id),
+                             tab_label=tab_labels.get(agent.tab_id))
+                     for agent in agents)
 
     def get_agent(self, pane_id: str) -> Agent:
         self._check_target(pane_id)
@@ -330,7 +361,8 @@ def _agent_info(value: object) -> Agent:
     # Detection/display values are optional. Never infer a kind from the name.
     kind = next((value[key] for key in ("agent", "display_agent")
                  if isinstance(value.get(key), str) and value[key] in {"codex", "claude"}), "unknown")
-    return Agent(value["workspace_id"], value["pane_id"], value.get("name"), kind, value["agent_status"])
+    return Agent(value["workspace_id"], value["pane_id"], value.get("name"), kind,
+                 value["agent_status"], value["tab_id"])
 
 
 def _resource_id(value: object, field: str) -> str:
@@ -358,7 +390,9 @@ def decode_protocol22(action: str, stdout: str) -> ControlResult:
         # Do not classify timeouts/name conflicts by searching human messages.
         return ControlResult(error="remote_error")
     result = envelope["result"]
-    expected = {"list": "agent_list", "get": "agent_info", "prompt": "agent_prompted",
+    expected = {"list": "agent_list", "workspace_list": "workspace_list",
+                "tab_list": "tab_list",
+                "get": "agent_info", "prompt": "agent_prompted",
                 "create": "workspace_created", "start": "agent_started"}
     if not isinstance(result, dict) or result.get("type") != expected.get(action):
         raise ValueError("Unexpected result type")
@@ -366,6 +400,32 @@ def decode_protocol22(action: str, stdout: str) -> ControlResult:
         if not isinstance(result.get("agents"), list):
             raise ValueError("Missing agent list")
         return ControlResult(agents=tuple(_agent_info(item) for item in result["agents"]))
+    if action == "workspace_list":
+        if not isinstance(result.get("workspaces"), list):
+            raise ValueError("Missing workspace list")
+        labels = []
+        for item in result["workspaces"]:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid workspace info")
+            workspace_id, label = item.get("workspace_id"), item.get("label")
+            if (not safe_identifier(workspace_id) or not isinstance(label, str)
+                    or not label.strip() or not safe_text(label) or "\n" in label):
+                raise ValueError("Invalid workspace info")
+            labels.append((workspace_id, label))
+        return ControlResult(workspace_labels=tuple(labels))
+    if action == "tab_list":
+        if not isinstance(result.get("tabs"), list):
+            raise ValueError("Missing tab list")
+        labels = []
+        for item in result["tabs"]:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid tab info")
+            tab_id, label = item.get("tab_id"), item.get("label")
+            if (not safe_identifier(tab_id) or not isinstance(label, str)
+                    or not label.strip() or not safe_text(label) or "\n" in label):
+                raise ValueError("Invalid tab info")
+            labels.append((tab_id, label))
+        return ControlResult(tab_labels=tuple(labels))
     if action in {"get", "start"}:
         if action == "start" and (
             not isinstance(result.get("argv"), list)

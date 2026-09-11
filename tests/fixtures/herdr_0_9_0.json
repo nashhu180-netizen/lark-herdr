@@ -39,6 +39,40 @@
       ]
     }
   },
+  "workspace_list": {
+    "id": "static-workspace_list",
+    "result": {
+      "type": "workspace_list",
+      "workspaces": [
+        {
+          "workspace_id": "workspace-a",
+          "label": "Project Alpha"
+        },
+        {
+          "workspace_id": "workspace-b",
+          "label": "项目乙"
+        }
+      ]
+    }
+  },
+  "tab_list": {
+    "id": "static-tab_list",
+    "result": {
+      "type": "tab_list",
+      "tabs": [
+        {
+          "workspace_id": "workspace-a",
+          "tab_id": "tab-a",
+          "label": "主控"
+        },
+        {
+          "workspace_id": "workspace-b",
+          "tab_id": "tab-b",
+          "label": "Review B"
+        }
+      ]
+    }
+  },
   "get": {
     "id": "static-agent_info",
     "result": {

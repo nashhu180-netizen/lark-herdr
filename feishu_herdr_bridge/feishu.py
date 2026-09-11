@@ -1,7 +1,7 @@
 """Minimal Feishu transport. Importing this module does not import/start the SDK.
 
 SDK: lark-oapi==1.7.3. All SDK construction is explicit and injectable in tests.
-No webhook server, auto-created groups, reply retry, or background task polling.
+Only confirmed group creation is supported; no webhook, retry, or task polling.
 """
 
 from __future__ import annotations
@@ -13,13 +13,17 @@ import re
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
+from uuid import UUID
 
-from .core import BridgeCore, Message, Prepared, Reply
+from .core import (
+    BridgeCore, GroupCreateError, GroupCreateInput, GroupCreateResult, Message, Prepared, Reply,
+)
 from .herdr import safe_identifier, safe_text
 
 
 _LOG = logging.getLogger(__name__)
 _EVENT = "im.message.receive_v1"
+_GROUP_CREATE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -80,7 +84,7 @@ def parse_event(data: object, bot_open_id: str) -> Message | None:
     stamp = _get(incoming, "create_time")
     created_at = (int(stamp) / 1000.0 if isinstance(stamp, str)
                   and re.fullmatch(r"[0-9]{1,16}", stamp) else None)
-    return Message(message_id, chat_id, user_id, text, created_at)
+    return Message(message_id, chat_id, user_id, text, created_at, chat_type)
 
 
 class FeishuBridge:
@@ -88,15 +92,15 @@ class FeishuBridge:
         self, core: BridgeCore, bot_open_id: str,
         send: Callable[[Message, Reply], None], *, thread_factory=threading.Thread,
     ) -> None:
-        if not safe_identifier(bot_open_id):
+        if not safe_identifier(bot_open_id) or (core.bot_open_id is not None and core.bot_open_id != bot_open_id):
             raise ValueError("bot_open_id is required for exact @ matching")
         self.core, self.bot_open_id, self.send = core, bot_open_id, send
         self._thread_factory = thread_factory
 
     def receive(self, data: object) -> threading.Thread | None:
         message = parse_event(data, self.bot_open_id)
-        if (message is None or message.chat_id not in self.core.allowed_chats
-                or message.user_id not in self.core.allowed_users):
+        if (message is None or (self.core.bot_open_id is not None and self.core.bot_open_id != self.bot_open_id)
+                or not self.core.is_authorized(message)):
             return None
         prepared = self.core.prepare(message)
         if isinstance(prepared, Reply):
@@ -120,7 +124,7 @@ class FeishuBridge:
             self.send(message, reply)
         except Exception:
             # Sending a receipt is independent of the persisted business result.
-            _LOG.warning("receipt_failed chat=%s message=%s", message.chat_id, message.message_id)
+            _LOG.warning("receipt_failed")
 
 
 def build_dispatcher(callback):
@@ -139,10 +143,53 @@ def build_text_request(chat_id: str, text: str):
                           .build()).build())
 
 
+def build_group_request(value: GroupCreateInput):
+    from lark_oapi.api.im.v1 import CreateChatRequest, CreateChatRequestBody
+    from lark_oapi.core.enum import AccessTokenType
+
+    if (not isinstance(value, GroupCreateInput) or not safe_identifier(value.requested_by)
+            or not safe_text(value.group_name) or not 1 <= len(value.group_name) <= 60
+            or any(c in value.group_name for c in ("\n", "\u2028", "\u2029"))
+            or str(UUID(value.create_uuid)) != value.create_uuid):
+        raise ValueError("Invalid confirmed group input")
+    body = (CreateChatRequestBody.builder().name(value.group_name)
+            .description(f"HerdR kpi-agg; G-{value.create_uuid}")
+            .owner_id(value.requested_by).user_id_list([value.requested_by])
+            .chat_mode("group").chat_type("private").external(False).build())
+    request = (CreateChatRequest.builder().user_id_type("open_id").uuid(value.create_uuid)
+               .request_body(body).build())
+    # Never select user identity, even if other SDK clients use user tokens.
+    request.token_types = {AccessTokenType.TENANT}
+    return request
+
+
+def decode_group_response(content: bytes, status: int, owner: str) -> GroupCreateResult:
+    """Validate raw primitive types; retain a known resource before other checks."""
+    try:
+        envelope = json.loads(content)
+    except (ValueError, TypeError):
+        return GroupCreateResult()
+    data = envelope.get("data") if isinstance(envelope, dict) else None
+    if not isinstance(data, dict):
+        return GroupCreateResult()
+    chat_id = data.get("chat_id")
+    known = chat_id if safe_identifier(chat_id) else None
+    verified = (known is not None and type(status) is int and 200 <= status < 300
+                and type(envelope.get("code")) is int and envelope["code"] == 0
+                and data.get("owner_id") == owner and data.get("owner_id_type") == "open_id"
+                and data.get("chat_mode") == "group" and data.get("chat_type") == "private"
+                and data.get("external") is False)
+    return GroupCreateResult(known, verified)
+
+
 class LarkTransport:
-    """Use the SDK's own loop for receipts; only start() opens a connection."""
+    """SDK event loop for receipts; a confirmed worker performs group creation."""
 
     def __init__(self, credentials: Credentials) -> None:
+        from importlib.metadata import version
+
+        if version("lark-oapi") != "1.7.3":
+            raise ValueError("The pinned SDK version is required")
         import lark_oapi as lark
 
         self._lark = lark
@@ -151,6 +198,7 @@ class LarkTransport:
                         .app_secret(credentials.app_secret).timeout(10)
                         .log_level(lark.LogLevel.ERROR).build())
         self._loop = None
+        self.is_stopping: Callable[[], bool] = lambda: False
 
     def start(self, bridge: FeishuBridge) -> None:
         def callback(data):
@@ -163,6 +211,79 @@ class LarkTransport:
             event_handler=dispatcher, log_level=self._lark.LogLevel.ERROR, auto_reconnect=True,
         )
         websocket.start()
+
+
+    def create_group(self, value: GroupCreateInput) -> GroupCreateResult:
+        """Use SDK create/models with a request-local, single-send HTTP boundary.
+
+        The pinned SDK does not expose redirect or pre-send hooks. Its chat
+        resource's Transport name is scoped below to this request only. Other
+        requests delegate unchanged; token and message modules are untouched.
+        The nonblocking lock prevents overlapping replacements. No SDK files or
+        global requests functions are changed, and the name is always restored.
+        """
+        if self.is_stopping() or not _GROUP_CREATE_LOCK.acquire(blocking=False):
+            raise GroupCreateError(uncertain=False)
+        sent = False
+        raw = None
+        try:
+            import requests
+            from lark_oapi.api.im.v1.resource import chat as chat_module
+            from lark_oapi.core.http.transport import _build_header
+            from lark_oapi.core.model import RawResponse
+            from lark_oapi.core.enum import AccessTokenType
+
+            request = build_group_request(value)
+            original = chat_module.Transport
+            stopping = self.is_stopping
+
+            class SingleSend(original):
+                @staticmethod
+                def execute(config, incoming, option=None):
+                    nonlocal sent, raw
+                    if incoming is not request:
+                        return original.execute(config, incoming, option)
+                    if sent or stopping():
+                        raise GroupCreateError(uncertain=sent)
+                    token = getattr(option, "tenant_access_token", None)
+                    if incoming.token_types != {AccessTokenType.TENANT} or not safe_identifier(token):
+                        raise GroupCreateError(uncertain=False)
+                    headers = _build_header(incoming, option, config)
+                    body = self._lark.JSON.marshal(incoming.body).encode("utf-8")
+                    # No redirect can turn one SDK invocation into a second POST.
+                    # A fresh Session has zero adapter retries; make that explicit.
+                    with requests.Session() as http:
+                        http.mount("https://", requests.adapters.HTTPAdapter(max_retries=0))
+                        if stopping():
+                            raise GroupCreateError(uncertain=False)
+                        sent = True
+                        response = http.request(
+                            "POST", "https://open.feishu.cn/open-apis/im/v1/chats",
+                            headers=headers, params=incoming.queries, data=body,
+                            timeout=(1.0, 2.0), allow_redirects=False,
+                        )
+                        raw = RawResponse()
+                        raw.status_code, raw.headers, raw.content = (
+                            response.status_code, dict(response.headers), response.content,
+                        )
+                    return raw
+
+            chat_module.Transport = SingleSend
+            try:
+                response = self._client.im.v1.chat.create(request)
+            finally:
+                chat_module.Transport = original
+            result = (decode_group_response(raw.content, raw.status_code, value.requested_by)
+                      if raw is not None else GroupCreateResult())
+            return GroupCreateResult(result.created_chat_id,
+                                     result.verified and response.success() and not stopping())
+        except Exception:
+            # SDK model decoding may fail after the raw response contained an ID.
+            result = (decode_group_response(raw.content, raw.status_code, value.requested_by)
+                      if raw is not None else GroupCreateResult())
+            raise GroupCreateError(created_chat_id=result.created_chat_id, uncertain=sent) from None
+        finally:
+            _GROUP_CREATE_LOCK.release()
 
     def send(self, message: Message, reply: Reply) -> None:
         if self._loop is None or self._loop.is_closed():
@@ -179,4 +300,4 @@ class LarkTransport:
             if not response.success():
                 raise RuntimeError("Receipt rejected")
         except Exception:
-            _LOG.warning("receipt_failed chat=%s message=%s", message.chat_id, message.message_id)
+            _LOG.warning("receipt_failed")
