@@ -2,7 +2,7 @@
 
 编写时间：2026-09-11。范围：Batch 3；设计以 `docs/design.md` 为准。
 
-HerdR 与飞书真实验收仍为未测。protocol-22 fixture 来自静态 schema，不能充当 live 证据。保留本地审核已修正的 `workspace.workspace_id`、`tab.tab_id`、`root_pane.pane_id` 及非零 CLI 从 stderr 解析结构化错误的契约。
+HerdR 与飞书的 Linux 核心 MVP 冒烟已于 2026-09-11 通过，逐项结果和剩余未测边界见 `docs/live-validation.md`。protocol-22 fixture 来自静态 schema，不能替代该真实证据。保留本地审核已修正的 `workspace.workspace_id`、`tab.tab_id`、`root_pane.pane_id` 及非零 CLI 从 stderr 解析结构化错误的契约。
 
 ## 1. 前置条件与离线检查
 
@@ -83,6 +83,10 @@ HerdR 与飞书真实验收仍为未测。protocol-22 fixture 来自静态 schem
     journalctl --user -u feishu-herdr-bridge.service -n 50 --no-pager
 
 在白名单群内 @ 机器人后依次使用 `/agents`、`/bind <workspace_id> <pane_id>`。收到绑定成功回执再发普通文本；`/read` 查看当前画面。新任务使用 `/new <项目别名> <codex或claude>`，核对目录和换绑目标，再由原发起人在同一会话发送 `/confirm <确认码>`。
+
+群消息必须使用飞书选择出的真实 @ mention，手工输入看起来相同的纯文本 `@机器人` 不会进入桥接。群可由用户手工创建，也可用官方 `lark-cli` 创建；桥接本身不负责建群。
+
+Codex 或 Claude 首次在新 Pane 启动时，可能被信任目录、登录或首次运行界面阻塞。此时 `/confirm` 可能返回 `remote_error`，同时报告已保留的 workspace/Pane；这是“结果不明”，不是可自动重试错误。打开该 Pane 人工处理阻塞，再用 `/agents` 核对 Agent 已为 idle，最后执行 `/bind <workspace_id> <pane_id>`。不要复用原确认码，也不要在检查现场前重新 `/new`。
 
 需要退出登录后持续运行时，由用户确认系统政策后执行 `loginctl enable-linger "$USER"`，再用 `loginctl show-user "$USER" -p Linger` 核验，必要时由本机管理员授权。linger 只保持用户服务，不保证 HerdR session 或 Agent 在主机重启后恢复。主机须接电、保持网络、禁用自动休眠；锁屏、退出登录和手机移动网络场景分别实测。
 
