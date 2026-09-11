@@ -315,3 +315,30 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.core.handle(message).code, "duplicate")
         self.assertEqual(len(self.fake.events("submitted")), 1)
         self.assertTrue(self.store.get_binding("chat-a").valid)
+
+    def test_prepare_claims_slot_without_cli_and_abandon_releases_it(self):
+        from feishu_herdr_bridge.core import Prepared
+
+        self.bind()
+        before = len(self.fake.events())
+        message = self.message("not started")
+        prepared = self.core.prepare(message)
+        self.assertIsInstance(prepared, Prepared)
+        self.assertTrue(self.lock.locked())
+        self.assertEqual(len(self.fake.events()), before)
+        self.assertEqual(self.send("other request").code, "busy")
+        self.assertEqual(self.core.abandon(prepared).code, "worker_unavailable")
+        self.assertFalse(self.lock.locked())
+        self.assertEqual(self.core.handle(message).code, "duplicate")
+        self.assertEqual(self.fake.events("submitted"), [])
+
+    def test_prepared_message_rechecks_binding_when_worker_executes(self):
+        self.bind()
+        prepared = self.core.prepare(self.message("do not retarget"))
+        old = self.store.get_binding("chat-a")
+        self.store.bind(chat_id="chat-a", session=SESSION, workspace_id="workspace-b", pane_id="pane-b",
+                        agent_name="other", user_id="user", now=self.now + 10,
+                        expected_revision=old.revision)
+        self.assertEqual(self.core.execute(prepared).code, "binding_changed")
+        self.assertFalse(self.lock.locked())
+        self.assertEqual(self.fake.events("submitted"), [])

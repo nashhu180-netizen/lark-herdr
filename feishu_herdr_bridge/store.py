@@ -13,6 +13,35 @@ class BindingChanged(Exception):
     """The caller's binding snapshot is no longer current."""
 
 
+class CreationRejected(Exception):
+    """A confirmation is invalid, expired, already used, or no longer current."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class Creation:
+    request_id: str
+    confirmation_code: str
+    chat_id: str
+    requested_by: str
+    project_path: str
+    workspace_label: str
+    agent_kind: str
+    agent_name: str
+    original_revision: int | None
+    expires_at: float
+    status: str
+    workspace_id: str | None
+    tab_id: str | None
+    pane_id: str | None
+    result_code: str
+    created_at: float
+    updated_at: float
+
+
 class WorkspaceOccupied(Exception):
     """Another chat already owns this workspace in the configured session."""
 
@@ -146,36 +175,47 @@ class Store:
         expected_revision: int | None,
     ) -> Binding:
         with self._transaction() as db:
-            old = db.execute(
-                "SELECT revision FROM bindings WHERE chat_id=?", (chat_id,)
-            ).fetchone()
-            revision = old["revision"] if old else None
-            if revision != expected_revision:
-                raise BindingChanged()
-            owner = db.execute(
-                "SELECT chat_id FROM bindings WHERE herdr_session=? AND workspace_id=?",
-                (session, workspace_id),
-            ).fetchone()
-            if owner and owner["chat_id"] != chat_id:
-                raise WorkspaceOccupied()
-            db.execute(
-                """INSERT INTO bindings VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
-                   ON CONFLICT(chat_id) DO UPDATE SET
-                     herdr_session=excluded.herdr_session,
-                     workspace_id=excluded.workspace_id,
-                     pane_id=excluded.pane_id,
-                     agent_name=excluded.agent_name, valid=1,
-                     revision=excluded.revision, bound_at=excluded.bound_at,
-                     bound_by=excluded.bound_by""",
-                (chat_id, session, workspace_id, pane_id, agent_name,
-                 (revision or 0) + 1, now, user_id),
+            return self._bind_in_transaction(
+                db, chat_id=chat_id, session=session, workspace_id=workspace_id,
+                pane_id=pane_id, agent_name=agent_name, user_id=user_id, now=now,
+                expected_revision=expected_revision,
             )
-            row = db.execute(
-                "SELECT * FROM bindings WHERE chat_id=?", (chat_id,)
-            ).fetchone()
-            binding = self._binding(row)
-            assert binding is not None
-            return binding
+
+    def _bind_in_transaction(
+        self, db: sqlite3.Connection, *, chat_id: str, session: str,
+        workspace_id: str, pane_id: str, agent_name: str | None, user_id: str,
+        now: float, expected_revision: int | None,
+    ) -> Binding:
+        old = db.execute(
+            "SELECT revision FROM bindings WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+        revision = old["revision"] if old else None
+        if revision != expected_revision:
+            raise BindingChanged()
+        owner = db.execute(
+            "SELECT chat_id FROM bindings WHERE herdr_session=? AND workspace_id=?",
+            (session, workspace_id),
+        ).fetchone()
+        if owner and owner["chat_id"] != chat_id:
+            raise WorkspaceOccupied()
+        db.execute(
+            """INSERT INTO bindings VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+               ON CONFLICT(chat_id) DO UPDATE SET
+                 herdr_session=excluded.herdr_session,
+                 workspace_id=excluded.workspace_id,
+                 pane_id=excluded.pane_id,
+                 agent_name=excluded.agent_name, valid=1,
+                 revision=excluded.revision, bound_at=excluded.bound_at,
+                 bound_by=excluded.bound_by""",
+            (chat_id, session, workspace_id, pane_id, agent_name,
+             (revision or 0) + 1, now, user_id),
+        )
+        row = db.execute(
+            "SELECT * FROM bindings WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+        binding = self._binding(row)
+        assert binding is not None
+        return binding
 
     def invalidate(self, snapshot: Binding) -> None:
         # A failed old request must never invalidate a newer binding.
@@ -196,7 +236,7 @@ class Store:
 
     def claim(
         self, *, message_id: str, chat_id: str, user_id: str, action: str,
-        snapshot: Binding | None, now: float,
+        snapshot: Binding | None, now: float, session: str | None = None,
     ) -> tuple[Request, bool]:
         with self._transaction() as db:
             cursor = db.execute(
@@ -204,7 +244,7 @@ class Store:
                    'processing', '', ?, ?) ON CONFLICT(message_id) DO NOTHING""",
                 (message_id, chat_id, user_id, action,
                  snapshot.revision if snapshot else None,
-                 snapshot.herdr_session if snapshot else None,
+                 snapshot.herdr_session if snapshot else session,
                  snapshot.workspace_id if snapshot else None,
                  snapshot.pane_id if snapshot else None, now, now),
             )
@@ -253,3 +293,112 @@ class Store:
                    result_code='interrupted', updated_at=? WHERE status='processing'""",
                 (now,),
             )
+
+    def propose_creation(self, creation: Creation) -> None:
+        with self._transaction() as db:
+            db.execute(
+                """UPDATE create_requests SET status='failed', result_code='superseded',
+                   updated_at=? WHERE chat_id=? AND status='pending'""",
+                (creation.created_at, creation.chat_id),
+            )
+            db.execute(
+                """INSERT INTO create_requests VALUES
+                   (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                tuple(getattr(creation, field) for field in Creation.__dataclass_fields__),
+            )
+
+    def find_creation(self, code: str, chat_id: str, user_id: str) -> Creation | None:
+        with self._connection() as db:
+            row = db.execute(
+                """SELECT * FROM create_requests WHERE confirmation_code=?
+                   AND chat_id=? AND requested_by=?""", (code, chat_id, user_id),
+            ).fetchone()
+            return Creation(**dict(row)) if row else None
+
+    def begin_creation(self, creation: Creation, session: str, now: float) -> Creation:
+        failure = None
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM create_requests WHERE request_id=?", (creation.request_id,),
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                raise CreationRejected("confirmation_used")
+            binding = db.execute(
+                "SELECT revision FROM bindings WHERE chat_id=?", (creation.chat_id,),
+            ).fetchone()
+            origin = db.execute(
+                "SELECT herdr_session FROM requests WHERE message_id=?", (creation.request_id,),
+            ).fetchone()
+            if now >= row["expires_at"]:
+                failure = "confirmation_expired"
+            elif (binding["revision"] if binding else None) != row["original_revision"]:
+                failure = "binding_changed"
+            elif origin is None or origin["herdr_session"] != session:
+                failure = "session_changed"
+            db.execute(
+                """UPDATE create_requests SET status=?, result_code=?, updated_at=?
+                   WHERE request_id=? AND status='pending'""",
+                ("failed" if failure else "processing", failure or "", now, creation.request_id),
+            )
+            updated = db.execute(
+                "SELECT * FROM create_requests WHERE request_id=?", (creation.request_id,),
+            ).fetchone()
+        if failure:
+            raise CreationRejected(failure)
+        return Creation(**dict(updated))
+
+    def cancel_creation(self, chat_id: str, now: float) -> bool:
+        with self._connection() as db:
+            cursor = db.execute(
+                """UPDATE create_requests SET status='failed', result_code='cancelled',
+                   updated_at=? WHERE chat_id=? AND status='pending'""", (now, chat_id),
+            )
+            return cursor.rowcount > 0
+
+    def rename_creation(self, request_id: str, name: str, now: float) -> None:
+        with self._connection() as db:
+            cursor = db.execute(
+                """UPDATE create_requests SET agent_name=?, updated_at=?
+                   WHERE request_id=? AND status='processing'""", (name, now, request_id),
+            )
+            if cursor.rowcount != 1:
+                raise CreationRejected("confirmation_used")
+
+    def save_created_workspace(
+        self, request_id: str, workspace_id: str, tab_id: str, pane_id: str, now: float,
+    ) -> None:
+        with self._connection() as db:
+            cursor = db.execute(
+                """UPDATE create_requests SET workspace_id=?, tab_id=?, pane_id=?, updated_at=?
+                   WHERE request_id=? AND status='processing'""",
+                (workspace_id, tab_id, pane_id, now, request_id),
+            )
+            if cursor.rowcount != 1:
+                raise CreationRejected("confirmation_used")
+
+    def finish_creation(self, request_id: str, status: str, code: str, now: float) -> None:
+        if status not in {"failed", "unknown"}:
+            raise ValueError("Use complete_creation for success")
+        with self._connection() as db:
+            db.execute(
+                """UPDATE create_requests SET status=?, result_code=?, updated_at=?
+                   WHERE request_id=? AND status='processing'""", (status, code, now, request_id),
+            )
+
+    def complete_creation(self, request_id: str, session: str, now: float) -> Binding:
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM create_requests WHERE request_id=?", (request_id,),
+            ).fetchone()
+            if row is None or row["status"] != "processing" or not row["workspace_id"] or not row["pane_id"]:
+                raise CreationRejected("confirmation_used")
+            binding = self._bind_in_transaction(
+                db, chat_id=row["chat_id"], session=session, workspace_id=row["workspace_id"],
+                pane_id=row["pane_id"], agent_name=row["agent_name"], user_id=row["requested_by"],
+                now=now, expected_revision=row["original_revision"],
+            )
+            db.execute(
+                """UPDATE create_requests SET status='done', result_code='created',
+                   updated_at=? WHERE request_id=?""", (now, request_id),
+            )
+            return binding

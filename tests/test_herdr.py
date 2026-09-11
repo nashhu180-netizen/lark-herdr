@@ -154,3 +154,104 @@ class AdapterTests(unittest.TestCase):
             runner=lambda cmd, t: subprocess.CompletedProcess(cmd, 1, "{}", ""),
         )
         self.assert_error("invalid_output", lambda: adapter.prompt("pane-a", "task"), uncertain=True)
+
+
+class Protocol22Tests(unittest.TestCase):
+    def setUp(self):
+        from feishu_herdr_bridge.herdr import decode_protocol22, session_command
+
+        self.fixture = json.loads((Path(__file__).parent / "fixtures/herdr_0_9_0.json").read_text(encoding="utf-8"))
+        self.calls = []
+
+        def runner(command, timeout):
+            self.calls.append(list(command))
+            args = command[3:]
+            action = "create" if args[:2] == ("workspace", "create") else args[1]
+            output = self.fixture["read_text"] if action == "read" else json.dumps(self.fixture[action])
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+        self.adapter = HerdrAdapter("explicit-session", command_builder=session_command("/configured/herdr"),
+                                    decoder=decode_protocol22, runner=runner)
+
+    def test_fixture_is_explicitly_static_not_live(self):
+        self.assertEqual(self.fixture["_meta"]["protocol"], 22)
+        self.assertEqual(self.fixture["_meta"]["source"], "schema-derived/static-not-live")
+        self.assertEqual(self.fixture["_meta"]["live_probe"], "pending")
+
+    def test_all_configured_commands_have_explicit_session_and_confirmed_options(self):
+        self.assertEqual(self.adapter.list_agents()[0].kind, "codex")
+        self.assertEqual(self.adapter.get_agent("pane-a").workspace_id, "workspace-a")
+        self.assertEqual(self.adapter.read_agent("pane-a"), self.fixture["read_text"])
+        self.adapter.prompt("pane-a", "中文\nsecond line")
+        workspace = self.adapter.create_workspace("/allowed/project", "demo-static")
+        self.assertEqual((workspace.workspace_id, workspace.tab_id, workspace.pane_id),
+                         ("workspace-new", "tab-new", "pane-new"))
+        self.adapter.start_agent("fb-codex-0123456789ab", "codex", "pane-new")
+        prefix = ["/configured/herdr", "--session", "explicit-session"]
+        self.assertEqual(self.calls, [
+            prefix + ["agent", "list"],
+            prefix + ["agent", "get", "pane-a"],
+            prefix + ["agent", "read", "pane-a", "--source", "visible", "--lines", "80", "--format", "text"],
+            prefix + ["agent", "prompt", "pane-a", "中文\nsecond line"],
+            prefix + ["workspace", "create", "--cwd", "/allowed/project", "--label", "demo-static", "--no-focus"],
+            prefix + ["agent", "start", "fb-codex-0123456789ab", "--kind", "codex", "--pane", "pane-new", "--timeout", "15000"],
+        ])
+
+    def test_optional_detection_fields_do_not_become_required_identity(self):
+        agent = self.fixture["get"]["result"]["agent"]
+        for key in ("name", "agent", "display_agent"):
+            agent.pop(key, None)
+        actual = self.adapter.get_agent("pane-a")
+        self.assertIsNone(actual.name)
+        self.assertEqual(actual.kind, "unknown")
+
+    def test_missing_required_agent_info_field_is_rejected(self):
+        del self.fixture["get"]["result"]["agent"]["workspace_id"]
+        with self.assertRaises(HerdrError) as error:
+            self.adapter.get_agent("pane-a")
+        self.assertEqual(error.exception.code, "invalid_output")
+
+    def test_unrecognized_result_shape_is_unknown_for_writes(self):
+        self.fixture["create"]["result"]["root_pane"] = {"unverified_key": "pane"}
+        with self.assertRaises(HerdrError) as error:
+            self.adapter.create_workspace("/project", "label")
+        self.assertTrue(error.exception.uncertain)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_unknown_error_codes_are_not_guessed_from_human_messages(self):
+        self.fixture["prompt"] = self.fixture["error"]
+        self.fixture["prompt"]["error"]["message"] = "blocked name conflict SECRET"
+        with self.assertRaises(HerdrError) as error:
+            self.adapter.prompt("pane-a", "task")
+        self.assertEqual(error.exception.code, "remote_error")
+        self.assertTrue(error.exception.uncertain)
+        self.assertNotIn("SECRET", str(error.exception))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_cli_error_envelope_is_read_from_stderr(self):
+        error_output = json.dumps(self.fixture["error"])
+
+        def runner(command, timeout):
+            self.calls.append(list(command))
+            return subprocess.CompletedProcess(command, 1, "", error_output)
+
+        self.adapter._runner = runner
+        with self.assertRaises(HerdrError) as error:
+            self.adapter.get_agent("pane-a")
+        self.assertEqual(error.exception.code, "remote_error")
+        self.assertFalse(error.exception.uncertain)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_ambiguous_envelope_does_not_confirm_success(self):
+        self.fixture["prompt"]["error"] = self.fixture["error"]["error"]
+        with self.assertRaises(HerdrError) as error:
+            self.adapter.prompt("pane-a", "task")
+        self.assertTrue(error.exception.uncertain)
+
+    def test_invalid_names_kinds_and_relative_paths_do_not_call_runner(self):
+        for name, kind in (("UPPER", "codex"), ("a" * 33, "codex"), ("a", "shell")):
+            with self.assertRaises(HerdrError):
+                self.adapter.start_agent(name, kind, "pane-new")
+        with self.assertRaises(HerdrError):
+            self.adapter.create_workspace("relative", "label")
+        self.assertEqual(self.calls, [])

@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import secrets
 import threading
 import time
 from _thread import LockType
 from dataclasses import dataclass
-from typing import Callable, Collection
+from pathlib import Path
+from typing import Callable, Collection, Mapping
 
-from .herdr import Agent, HerdrAdapter, HerdrError, safe_identifier, safe_text
-from .store import Binding, BindingChanged, Store, WorkspaceOccupied
+from .herdr import Agent, HerdrAdapter, HerdrError, Workspace, safe_identifier, safe_text, valid_agent_name
+from .store import Binding, BindingChanged, Creation, CreationRejected, Store, WorkspaceOccupied
 
 
 _OPERATION_LOCK = threading.Lock()
-_HELP = "/agents | /bind | /bind <workspace_id> <pane_id> | /read"
+_HELP = ("/agents | /bind | /bind <workspace_id> <pane_id> | /read | "
+         "/new <项目别名> <codex或claude> | /confirm <确认码> | /cancel")
 
 
 @dataclass(frozen=True)
@@ -33,22 +37,45 @@ class Reply:
     text: str
 
 
+@dataclass(frozen=True)
+class Prepared:
+    message: Message
+    action: str
+    args: list[str]
+    snapshot: Binding | None
+
+
+def agent_name(kind: str) -> str:
+    return f"fb-{kind}-{secrets.token_hex(6)}"
+
+
 class BridgeCore:
     def __init__(
         self, store: Store, herdr: HerdrAdapter, *, allowed_chats: Collection[str],
         allowed_users: Collection[str], clock: Callable[[], float] = time.time,
         operation_lock: LockType | None = None,
+        projects: Mapping[str, str | Path] | None = None,
     ) -> None:
         self.store = store
         self.herdr = herdr
         self.allowed_chats = frozenset(allowed_chats)
         self.allowed_users = frozenset(allowed_users)
         self.clock = clock
+        self.projects = dict(projects or {})
         self._lock = operation_lock if operation_lock is not None else _OPERATION_LOCK
         # Construct one core at process startup, before accepting any messages.
         self.store.recover_incomplete(self.clock())
 
     def handle(self, message: Message) -> Reply:
+        prepared = self.prepare(message)
+        return prepared if isinstance(prepared, Reply) else self.execute(prepared)
+
+    def prepare(self, message: Message) -> Prepared | Reply:
+        """Claim/deduplicate and acquire the slot before creating a worker.
+
+        This performs only short SQLite work, never a CLI/network call.
+        The caller must execute or abandon an accepted Prepared exactly once.
+        """
         if (message.chat_id not in self.allowed_chats
                 or message.user_id not in self.allowed_users):
             return Reply("failed", "forbidden", "用户或会话未获授权。")
@@ -62,7 +89,7 @@ class BridgeCore:
             previous, is_new = self.store.claim(
                 message_id=message.message_id, chat_id=message.chat_id,
                 user_id=message.user_id, action=action, snapshot=snapshot,
-                now=self.clock(),
+                now=self.clock(), session=self.herdr.session,
             )
         except Exception:
             return Reply("unknown", "storage_error", "状态存储不可用，未执行操作。")
@@ -75,6 +102,20 @@ class BridgeCore:
             return self._record(message, snapshot, action, Reply(
                 "failed", "busy", "桥接正处理其他短操作，请稍后发送新消息重试。"
             ))
+        return Prepared(message, action, args, snapshot)
+
+    def abandon(self, prepared: Prepared) -> Reply:
+        try:
+            return self._record(prepared.message, prepared.snapshot, prepared.action, Reply(
+                "failed", "worker_unavailable", "工作线程未启动，未执行操作，请发送新消息。"
+            ))
+        finally:
+            self._lock.release()
+
+    def execute(self, prepared: Prepared) -> Reply:
+        message, action, args, snapshot = (
+            prepared.message, prepared.action, prepared.args, prepared.snapshot
+        )
         try:
             try:
                 reply = self._dispatch(message, action, args, snapshot)
@@ -82,6 +123,8 @@ class BridgeCore:
                 reply = Reply("failed", "workspace_occupied", "该 workspace 已被其他会话绑定。")
             except BindingChanged:
                 reply = Reply("failed", "binding_changed", "绑定已变化，原消息未改投，请发送新消息。")
+            except CreationRejected as exc:
+                reply = Reply("failed", exc.code, f"创建确认不可执行（{exc.code}），请重新 /new。")
             except HerdrError as exc:
                 self._invalidate_quietly(snapshot, action)
                 prefix = self._label(snapshot) if snapshot else ""
@@ -129,13 +172,27 @@ class BridgeCore:
             return "binding", []
         if words[0] == "/bind" and len(words) == 3:
             return "bind", words[1:]
+        if words[0] == "/new" and len(words) == 3:
+            return "new", words[1:]
+        if words[0] == "/confirm" and len(words) == 2:
+            return "confirm", words[1:]
+        if words == ["/cancel"]:
+            return "cancel", []
         return "unknown_command", []
 
     def _dispatch(self, message: Message, action: str, args: list[str], snapshot: Binding | None) -> Reply:
         if action == "invalid_input":
             return Reply("failed", action, "文本为空或含终端控制字符，未投递。")
         if action == "unknown_command":
-            return Reply("failed", action, f"Batch 1 支持：{_HELP}。其他斜杠命令不会透传。")
+            return Reply("failed", action, f"支持：{_HELP}。其他斜杠命令不会透传。")
+        if action == "new":
+            return self._propose(message, args, snapshot)
+        if action == "confirm":
+            return self._confirm(message, args[0])
+        if action == "cancel":
+            cancelled = self.store.cancel_creation(message.chat_id, self.clock())
+            return Reply("done", "cancelled" if cancelled else "nothing_to_cancel",
+                         "已取消待执行请求。" if cancelled else "本会话没有待执行的创建请求。")
         if action == "agents":
             agents = self.herdr.list_agents()
             owners = self.store.owners(self.herdr.session)
@@ -188,6 +245,101 @@ class BridgeCore:
             return Reply("done", "read", f"{label}\n{content}" + ("\n[输出已截断]" if truncated else ""))
         self.herdr.prompt(snapshot.pane_id, message.text)
         return Reply("done", "submitted", f"{label}已提交，尚未确认任务完成。")
+
+    def _project_path(self, alias: str) -> str:
+        configured = self.projects.get(alias)
+        if configured is None or not safe_identifier(alias):
+            raise CreationRejected("invalid_project")
+        try:
+            path = Path(configured)
+            if not path.is_absolute():
+                raise ValueError("Relative project path")
+            path = path.resolve(strict=True)
+            if not path.is_dir() or not safe_text(str(path)) or "\n" in str(path):
+                raise ValueError("Invalid project directory")
+            return str(path)
+        except (OSError, ValueError, RuntimeError):
+            raise CreationRejected("invalid_project") from None
+
+    def _propose(self, message: Message, args: list[str], snapshot: Binding | None) -> Reply:
+        alias, kind = args
+        if kind not in {"codex", "claude"}:
+            raise CreationRejected("invalid_agent")
+        if snapshot is not None and snapshot.herdr_session != self.herdr.session:
+            raise CreationRejected("session_changed")
+        path = self._project_path(alias)
+        now = self.clock()
+        # Reuse the originating message ID so its saved session is authoritative.
+        short_id = hashlib.sha256(message.message_id.encode("utf-8")).hexdigest()[:8]
+        creation = Creation(
+            message.message_id, secrets.token_hex(4), message.chat_id, message.user_id,
+            path, f"{alias}-{short_id}", kind, agent_name(kind),
+            snapshot.revision if snapshot else None, now + 300.0, "pending",
+            None, None, None, "", now, now,
+        )
+        if not valid_agent_name(creation.agent_name):
+            raise CreationRejected("invalid_agent_name")
+        self.store.propose_creation(creation)
+        old = self._label(snapshot) if snapshot else "未绑定"
+        return Reply("done", "creation_pending", (
+            f"目录：{path}\nWorkspace：{creation.workspace_label}\n"
+            f"Agent：{kind} / {creation.agent_name}\n成功后替换：{old}\n"
+            f"尚未创建资源。5 分钟内由发起人在本会话发送 /confirm {creation.confirmation_code}。"
+        ))
+
+    def _confirm(self, message: Message, code: str) -> Reply:
+        creation = self.store.find_creation(code, message.chat_id, message.user_id)
+        if creation is None:
+            raise CreationRejected("invalid_confirmation")
+        if creation.status != "pending":
+            raise CreationRejected("confirmation_used")
+        # Re-resolve configured directories. A changed symlink must not redirect creation.
+        for alias in self.projects:
+            try:
+                current_path = self._project_path(alias)
+            except CreationRejected:
+                continue
+            if current_path == creation.project_path:
+                break
+        else:
+            raise CreationRejected("project_changed")
+        creation = self.store.begin_creation(creation, self.herdr.session, self.clock())
+        workspace: Workspace | None = None
+        try:
+            names = {agent.name for agent in self.herdr.list_agents() if agent.name is not None}
+            name = creation.agent_name
+            if name in names:
+                name = agent_name(creation.agent_kind)
+                if not valid_agent_name(name) or name in names:
+                    raise HerdrError("name_conflict")
+                self.store.rename_creation(creation.request_id, name, self.clock())
+            workspace = self.herdr.create_workspace(creation.project_path, creation.workspace_label)
+            self.store.save_created_workspace(
+                creation.request_id, workspace.workspace_id, workspace.tab_id, workspace.pane_id, self.clock(),
+            )
+            started = self.herdr.start_agent(name, creation.agent_kind, workspace.pane_id)
+            actual = self.herdr.get_agent(workspace.pane_id)
+            for agent in (started, actual):
+                if (agent.workspace_id != workspace.workspace_id or agent.pane_id != workspace.pane_id
+                        or agent.kind != creation.agent_kind):
+                    raise HerdrError("start_unverified", uncertain=True)
+            binding = self.store.complete_creation(creation.request_id, self.herdr.session, self.clock())
+            return Reply("done", "created", f"{self._label(binding)}已创建并绑定 {name}，可发送任务正文。")
+        except HerdrError as exc:
+            status, result = ("unknown" if exc.uncertain else "failed"), exc.code
+        except (BindingChanged, WorkspaceOccupied, CreationRejected):
+            status, result = "failed", "binding_changed_or_occupied"
+        except Exception:
+            status, result = "unknown", "creation_interrupted"
+        try:
+            self.store.finish_creation(creation.request_id, status, result, self.clock())
+        except Exception:
+            status, result = "unknown", "storage_error"
+        resource = (f"[{workspace.workspace_id} / {workspace.pane_id}] 已创建的资源保留。"
+                    if workspace else "尚未确认新资源 ID，请核对现场。")
+        return Reply(status, result,
+                     f"创建请求 {creation.request_id} 未完成（{result}）。{resource}"
+                     "旧绑定未修改。没有自动重试；本确认码不可再次执行。")
 
     def _validated_target(self, snapshot: Binding) -> Agent:
         self._assert_current(snapshot)
