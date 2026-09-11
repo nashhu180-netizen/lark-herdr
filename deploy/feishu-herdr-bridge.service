@@ -1,0 +1,21 @@
+[Unit]
+Description=Feishu to HerdR bridge (user service)
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_DIR@
+ExecStart="@VENV_PYTHON@" -m feishu_herdr_bridge --config "%h/.config/feishu-herdr-bridge/config.json"
+EnvironmentFile=%h/.config/feishu-herdr-bridge/credentials.env
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Restart=on-failure
+RestartPreventExitStatus=2 3
+RestartSec=3
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

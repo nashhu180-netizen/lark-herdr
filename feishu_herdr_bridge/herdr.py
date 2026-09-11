@@ -11,6 +11,7 @@ import json
 import math
 import re
 import subprocess
+import threading
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +73,74 @@ def run_command(command: Sequence[str], timeout: float) -> subprocess.CompletedP
     )
 
 
+class CommandInterrupted(Exception):
+    """Local shutdown; a started command may already have caused a write."""
+
+    def __init__(self, *, started: bool) -> None:
+        super().__init__("command_interrupted")
+        self.started = started
+
+
+class ManagedRunner:
+    """One tracked CLI child; no queue, retry, server stop, or Agent signalling."""
+
+    def __init__(self) -> None:
+        self._stopping = threading.Event()
+        self._guard = threading.Lock()
+        self._process: subprocess.Popen[str] | None = None
+
+    def __call__(self, command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        with self._guard:
+            if self._stopping.is_set():
+                raise CommandInterrupted(started=False)
+            if self._process is not None:
+                raise RuntimeError("CLI operation already active")
+            process = subprocess.Popen(
+                list(command), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", shell=False,
+            )
+            self._process = process
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+            if self._stopping.is_set():
+                raise CommandInterrupted(started=True)
+            return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
+        except BaseException:
+            # Killing the CLI cannot retract a request already received by HerdR.
+            self._terminate(process, grace=0.2)
+            raise
+        finally:
+            if process.poll() is not None:
+                with self._guard:
+                    if self._process is process:
+                        self._process = None
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen[str], grace: float) -> bool:
+        try:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=grace)
+        except (OSError, subprocess.TimeoutExpired):
+            return process.poll() is not None
+        return True
+
+    def stop(self, grace: float = 1.0) -> bool:
+        # Set the flag before taking the guard, covering shutdown/spawn races.
+        self._stopping.set()
+        with self._guard:
+            process = self._process
+        return process is None or self._terminate(process, grace)
+
+
 class HerdrAdapter:
     def __init__(
         self, session: str, *, command_builder: CommandBuilder | None = None,
@@ -111,6 +180,8 @@ class HerdrAdapter:
             if not isinstance(result, subprocess.CompletedProcess):
                 raise TypeError("Runner must return CompletedProcess")
             return result
+        except CommandInterrupted as exc:
+            raise HerdrError("interrupted", uncertain=exc.started) from None
         except subprocess.TimeoutExpired:
             raise HerdrError("timeout", uncertain=True) from None
         except (FileNotFoundError, PermissionError):
@@ -126,7 +197,7 @@ class HerdrAdapter:
             # HerdR CLI successes are written to stdout while structured
             # server errors are written to stderr. Batch 1's synthetic fake
             # used stdout for both, so retain that fallback for old tests.
-            payload = process.stdout if process.returncode == 0 or process.stdout.strip() else process.stderr
+            payload = process.stdout if process.returncode == 0 or not process.stderr.strip() else process.stderr
             result = self._decoder(action, payload)
             if not isinstance(result, ControlResult):
                 raise ValueError("Invalid decoder result")
