@@ -290,7 +290,12 @@ class BridgeCore:
             workspaces: dict[str, list[Agent]] = {}
             for agent in agents:
                 workspaces.setdefault(agent.workspace_id, []).append(agent)
-            lines = [f"{len(workspaces)} 个 workspace / {len(agents)} 个 Pane/Agent："]
+            lines = [f"Workspace（{len(workspaces)}）："]
+            for workspace_id, members in workspaces.items():
+                lines.append(
+                    f"- {workspace_id} | {members[0].workspace_label or '(无 workspace 名称)'}"
+                )
+            lines.extend(("", f"Pane/Agent（{len(agents)}）："))
             for workspace_id, members in workspaces.items():
                 lines.append(
                     f"{workspace_id} | {members[0].workspace_label or '(无 workspace 名称)'}"

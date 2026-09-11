@@ -280,11 +280,12 @@ class CoreTests(unittest.TestCase):
     def test_agents_and_binding_display_are_target_aware(self):
         self.bind()
         text = self.send("/agents").text
-        self.assertIn("2 个 workspace / 2 个 Pane", text)
-        self.assertIn("workspace-a | Project Alpha", text)
+        self.assertIn("Workspace（2）：", text)
+        self.assertIn("Pane/Agent（2）：", text)
+        self.assertIn("- workspace-a | Project Alpha", text)
         self.assertIn("  pane-a | lead-a", text)
         self.assertIn("workspace-b | 项目乙", text)
-        self.assertEqual(text.count("workspace-a | Project Alpha"), 1)
+        self.assertEqual(text.count("workspace-a | Project Alpha"), 2)
         self.assertIn("本会话", text)
         self.assertIn("未绑定", text)
         self.assertIn("workspace-a / pane-a", self.send("/bind").text)
