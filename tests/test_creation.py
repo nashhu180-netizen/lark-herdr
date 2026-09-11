@@ -313,11 +313,17 @@ class CreationTests(unittest.TestCase):
 
     def test_old_workspace_confirmation_survives_schema_upgrade(self):
         creation = self.propose()
-        # Reproduce the old three-table database with its pending confirmation.
-        with closing(sqlite3.connect(self.store.path)) as db:
-            db.execute('DROP TABLE group_requests')
-            db.execute('PRAGMA user_version=0')
-        self.store = Store(self.store.path)
+        # Put the pending legacy data in the independently frozen v1 schema.
+        # Do not relabel a v2 table as v0/v1 to simulate an old database.
+        legacy_path = self.root / 'legacy-v1.sqlite3'
+        with closing(sqlite3.connect(legacy_path)) as db, db, \
+                closing(sqlite3.connect(self.store.path)) as source:
+            db.executescript((Path(__file__).parent / 'fixtures/schema_v1.sql').read_text(encoding='utf-8'))
+            for table in ('bindings', 'requests', 'create_requests', 'group_requests'):
+                for row in source.execute(f'SELECT rowid, * FROM {table}'):
+                    columns = ','.join(['rowid'] + [item[1] for item in source.execute(f'PRAGMA table_info({table})')])
+                    db.execute(f"INSERT INTO {table} ({columns}) VALUES ({','.join('?' for _ in row)})", row)
+        self.store = Store(legacy_path)
         self.core = self.make_core()
         self.assertEqual(self.confirm(creation).code, 'created')
         self.assertEqual((len(self.cli.created), len(self.cli.started)), (1, 1))
