@@ -6,7 +6,7 @@ Date: 2026-09-11. Status: DESIGN_READY_FOR_LOCAL_REVIEW. This is a plan, not imp
 
 Use [the Devin design](devin-agent-design.md) as the narrowly scoped extension to the existing design. Baseline: `ee57eca173bb7994695d44a9643fb577eb10922a`; Issue #5 / Draft PR #6; branch `feat/devin-agent-support`, initially `01943772dc588cf48c2223e13a5cd5aa4b33549f`. The prior 166/166 suite is user-reported local baseline evidence; all checks below are not run.
 
-Devin authors implementation and tests. Local Codex applies/pulls, checks scope, runs Linux tests, reviews, and performs any approved narrow fixes with regression evidence. Each batch stops for review. No implementation begins until the design and migration plan are approved.
+GPT-6 Pro authors implementation and tests. Local Codex applies/pulls, checks scope, runs Linux tests, reviews, and performs any approved narrow fixes with regression evidence. Each batch stops for review. No implementation begins until the design and migration plan are approved.
 
 The live service keeps using main while both batches are developed in an isolated worktree. Use a worktree-local virtual environment and temporary databases; never install the candidate into the live editable environment, use live credentials, start a second bot consumer, or pass the live configuration/database into tests. Do not run candidate `Store` initialization against the live database as a probe.
 
