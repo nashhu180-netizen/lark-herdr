@@ -283,7 +283,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("Workspace（2）：", text)
         self.assertIn("Pane/Agent（2）：", text)
         self.assertIn("- workspace-a | Project Alpha", text)
-        self.assertIn("  pane-a | lead-a", text)
+        self.assertIn("  pane-a | Tab: 主控 | Agent: lead-a", text)
         self.assertIn("workspace-b | 项目乙", text)
         self.assertEqual(text.count("workspace-a | Project Alpha"), 2)
         self.assertIn("本会话", text)

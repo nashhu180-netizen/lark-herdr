@@ -30,6 +30,10 @@ def decode_control(action, stdout):
         return ControlResult(workspace_labels=tuple(
             (item["workspace_id"], item["label"]) for item in obj["workspaces"]
         ))
+    if action == "tab_list":
+        return ControlResult(tab_labels=tuple(
+            (item["tab_id"], item["label"]) for item in obj["tabs"]
+        ))
     return ControlResult()
 
 
@@ -43,11 +47,12 @@ class FakeHerdR:
                     "workspace-a": "Project Alpha",
                     "workspace-b": "项目乙",
                 },
+                "tabs": {"tab-a": "主控", "tab-b": "Review B"},
                 "agents": {
                     "pane-a": {"workspace_id": "workspace-a", "pane_id": "pane-a",
-                               "name": "lead-a", "kind": "codex", "status": "idle"},
+                               "tab_id": "tab-a", "name": "lead-a", "kind": "codex", "status": "idle"},
                     "pane-b": {"workspace_id": "workspace-b", "pane_id": "pane-b",
-                               "name": "lead-b", "kind": "claude", "status": "idle"},
+                               "tab_id": "tab-b", "name": "lead-b", "kind": "claude", "status": "idle"},
                 },
                 "screens": {"pane-a": "screen-A\n", "pane-b": "screen-B\n"},
             }},
@@ -104,6 +109,14 @@ def main() -> int:
             return 2
         output(workspaces=[{"workspace_id": key, "label": value}
                            for key, value in data["workspaces"].items()])
+        return 0
+    if args == ["tab", "list"]:
+        data = state["sessions"].get(session)
+        if data is None:
+            output(False, error="target_missing")
+            return 2
+        output(tabs=[{"tab_id": key, "label": value}
+                     for key, value in data["tabs"].items()])
         return 0
     if len(args) < 2 or args[0] != "agent":
         output(False, error="rejected")
