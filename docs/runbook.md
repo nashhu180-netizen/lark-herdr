@@ -79,9 +79,13 @@
 
 私下记录原运行提交和备份目录；不要把刚拉取的工作树提交误记为原运行版本。备份保持目录 `0700`、文件 `0600`，不入仓库。保留原凭据文件的 `0600` 权限，不输出其内容。
 
-本轮只新增 `group_requests`。启动时在实例锁内迁移：旧库 `user_version=0` 一次事务建表并升为 1；版本 1 核验结构，不重复迁移。未知版本、表结构或约束冲突会停止启动，不自动修库。`done` 必须有非空 `created_chat_id`、群 ID 唯一等约束在数据库中执行，原三表及数据保留。启动程序会打开数据库并连接 SDK，不能将它当作无副作用的校验命令。
+数据库当前目标版本为 `user_version=2`。启动时在实例锁内严格识别历史 v0、四表 v1 和 v2：v1→v2 在同一事务中重建 `create_requests`，仅将 `agent_kind` 的 CHECK 扩大为 `codex/claude/devin`，保留 rowid、全部列值和原有约束；历史 v0 同事务升级，新库直接得到 v2，已有 v2 只核验、不重复复制。`group_requests`、群授权、绑定和幂等数据不变。未知版本、表结构、索引或依赖冲突会停止启动，不自动修库；详见 `docs/devin-agent-design.md` 第 4 节。启动程序会打开数据库并连接 SDK，不能将它当作无副作用的校验命令。
 
 迁移失败时停住服务以中止自动重启，保留原库、备份和脱敏日志，交本地 Codex 核查。不得删表、重置 `user_version` 或删除数据库重建。若部署后可能发生过远端写，不能直接恢复写前备份再启动；旧备份可能丢失已消费确认码和受管群记录，须先核对远端与最新本地状态，再审核恢复步骤。
+
+Devin 开发和离线回归只在隔离 worktree、独立环境与临时数据库中进行，live 服务继续使用已接受的 main。只有本地协调者批准的维护窗口才能按上述步骤停服、备份并部署候选版本，不并行启动第二个消费者，不把候选 `Store` 指向 live 数据库作探针。
+
+v2 数据库不能交给只接受 v1 的旧程序（包括 `ee57eca`）直接启动；不提供自动降级。升级后已有远端写时，恢复写前备份可能丢失已消费确认码和受管群，禁止据此重发创建。保留最新 v2 状态并交本地审核恢复或使用兼容 v2 的窄修版本，不手改 `user_version` 绕过检查。
 
 ## 3. 安装用户服务模板
 
@@ -122,7 +126,11 @@
     systemctl --user is-active feishu-herdr-bridge.service
     journalctl --user -u feishu-herdr-bridge.service -n 50 --no-pager
 
-在白名单群内 @ 机器人后依次使用 `/agents`、`/bind <workspace_id> <pane_id>`。收到绑定成功回执再发普通文本；`/read` 查看当前画面。新任务使用 `/new <项目别名> <codex或claude>`，核对目录和换绑目标，再由原发起人在同一会话发送 `/confirm <确认码>`。
+在白名单群内 @ 机器人后依次使用 `/agents`、`/bind <workspace_id> <pane_id>`。收到绑定成功回执再发普通文本；`/read` 查看当前画面。新任务使用 `/new <项目别名> <codex或claude或devin>`，核对目录和换绑目标，再由原发起人在同一会话发送 `/confirm <确认码>`。
+
+Devin 使用 `/new <项目别名> devin`，kind 区分大小写且只接受 `codex`、`claude`、`devin`。提案阶段不创建资源，名称为 `fb-devin-<12位小写十六进制随机串>`；由原请求者在原群五分钟内确认。只有新 workspace 的根 Pane 在启动结果及后续 get 中都通过 workspace/Pane/kind 核验才换绑；冲突、阻塞或未知结果按既有规则保留资源，不自动重试或强制绑定。
+
+Devin 的受控真实验收另按 `docs/devin-agent-plan.md` 第 4 节由本地协调者执行，本补丁不宣称已通过。仅使用新建飞书任务群和该请求新建的 Devin workspace；禁止绑定或发送任务到既有 KPI workspace/Pane，也不增加权限绕过、初始化自动处理或其他 kind。
 
 群消息必须使用飞书选择出的真实 @ mention，手工输入同形文本不会进入桥接。管理群可以不绑定 workspace，建群动作不应调用 HerdR。
 

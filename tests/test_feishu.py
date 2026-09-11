@@ -181,6 +181,66 @@ class FeishuTests(unittest.TestCase):
         self.assertEqual(self.dispatch(event("new task", "task", group=True)).code, "submitted")
         self.assertEqual(cli.submitted, [(self.store.get_binding("chat-a").pane_id, "new task")])
 
+    def test_devin_creation_from_done_dynamic_group_uses_existing_entry_without_sdk(self):
+        import re
+        from unittest.mock import Mock
+        from feishu_herdr_bridge.core import GroupCreateResult
+        from tests.test_creation import StaticCLI
+
+        cli = StaticCLI()
+        cli.session = "kpi-agg"
+        creator = Mock(side_effect=[GroupCreateResult("fixture-dynamic-a", True),
+                                    GroupCreateResult("fixture-dynamic-b", True)])
+        self.core = BridgeCore(self.store, cli.adapter(), allowed_users={"user"}, allowed_chats={"chat-a"},
+                               management_chat_id="chat-a", admin_users={"user"}, bot_open_id=BOT,
+                               create_group=creator, projects={"demo": self.root},
+                               clock=lambda: 100.0, operation_lock=threading.Lock())
+        self.bridge = FeishuBridge(self.core, BOT, lambda m, r: self.sent.append((m, r)))
+        sequence = 0
+
+        def send(text, chat="chat-a"):
+            nonlocal sequence
+            sequence += 1
+            return self.dispatch(event(text, f"devin-entry-{sequence}", chat=chat, group=True))
+
+        self.assertEqual(send("/bind workspace-a pane-a").code, "bound")
+        management_binding = self.store.get_binding("chat-a")
+        for chat in ("fixture-dynamic-a", "fixture-dynamic-b"):
+            proposal = send("/group-new synthetic task group")
+            self.assertEqual(proposal.code, "group_pending")
+            code = re.search(r"g-[0-9a-f]{16}", proposal.text).group()
+            self.assertEqual(send("/confirm " + code).code, "group_created")
+            self.assertNotIn(chat, self.core.allowed_chats)
+            self.assertIsNone(self.store.get_binding(chat))
+            self.assertEqual(send("/agents", chat).code, "agents")
+        before = len(cli.calls)
+        proposal = send("/new demo devin", "fixture-dynamic-a")
+        self.assertEqual(proposal.code, "creation_pending")
+        self.assertEqual(len(cli.calls), before)
+        self.assertIsNone(self.store.get_binding("fixture-dynamic-a"))
+        code = re.search(r"/confirm ([0-9a-f]{8})", proposal.text).group(1)
+        confirmation = event("/confirm " + code, "devin-entry-confirm", chat="fixture-dynamic-a", group=True)
+        self.assertEqual(self.dispatch(confirmation).code, "created")
+        binding = self.store.get_binding("fixture-dynamic-a")
+        self.assertEqual((binding.herdr_session, binding.workspace_id, binding.pane_id),
+                         ("kpi-agg", cli.created[0][0], cli.created[0][2]))
+        self.assertEqual(cli.started, [(binding.agent_name, "devin", binding.pane_id)])
+        self.assertRegex(binding.agent_name, r"^fb-devin-[0-9a-f]{12}$")
+        self.assertEqual(self.dispatch(confirmation).code, "duplicate")
+        self.assertEqual(send("/confirm " + code, "fixture-dynamic-a").code, "confirmation_used")
+        self.assertEqual(send(f"/bind {binding.workspace_id} {binding.pane_id}", "fixture-dynamic-b").code,
+                         "workspace_occupied")
+        self.assertEqual(send("only the new fake Pane", "fixture-dynamic-a").code, "submitted")
+        self.assertEqual(cli.submitted, [(binding.pane_id, "only the new fake Pane")])
+        self.assertIn(binding.pane_id, send("/read", "fixture-dynamic-a").text)
+        self.assertIn("| devin |", send("/agents", "fixture-dynamic-a").text)
+        self.assertEqual(send("/group-new forbidden here", "fixture-dynamic-a").code, "forbidden")
+        self.assertEqual(self.store.get_binding("chat-a"), management_binding)
+        self.assertEqual(creator.call_count, 2)
+        self.assertEqual(len(cli.created), 1)
+        self.assertTrue(self.store.group_allowed("fixture-dynamic-a", "kpi-agg", BOT))
+        self.assertTrue(self.store.group_allowed("fixture-dynamic-b", "kpi-agg", BOT))
+
     def test_config_and_missing_credentials_are_offline_and_do_not_start_sdk(self):
         from feishu_herdr_bridge.__main__ import load_config, main
 

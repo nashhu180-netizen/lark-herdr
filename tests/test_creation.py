@@ -146,8 +146,8 @@ class CreationTests(unittest.TestCase):
         self.assertEqual(self.store.get_binding("chat-a"), old)
         self.assertEqual(self.store.get_request(creation.request_id).herdr_session, self.cli.session)
 
-    def test_both_kinds_create_then_start_then_verify_then_bind(self):
-        for kind in ("codex", "claude"):
+    def test_three_kinds_create_then_start_then_verify_then_bind(self):
+        for kind in ("codex", "claude", "devin"):
             with self.subTest(kind=kind):
                 creation = self.propose(kind)
                 self.assertEqual(self.confirm(creation).code, "created")
@@ -158,8 +158,8 @@ class CreationTests(unittest.TestCase):
                 self.assertEqual(self.cli.started[-1][1], kind)
                 self.assertEqual([a for a, _ in self.cli.calls[-4:]], ["list", "create", "start", "get"])
                 self.assertEqual(self.store.find_creation(creation.confirmation_code, "chat-a", "user").status, "done")
-        self.assertEqual(len(self.cli.created), 2)
-        self.assertEqual(self.store.get_binding("chat-a").revision, 2)
+        self.assertEqual(len(self.cli.created), 3)
+        self.assertEqual(self.store.get_binding("chat-a").revision, 3)
 
     def test_invalid_cross_user_cross_chat_and_expired_confirm_never_write(self):
         creation = self.propose()
@@ -328,3 +328,166 @@ class CreationTests(unittest.TestCase):
         self.assertEqual(self.confirm(creation).code, 'created')
         self.assertEqual((len(self.cli.created), len(self.cli.started)), (1, 1))
         self.assertEqual(self.store.get_binding('chat-a').pane_id, self.cli.created[0][2])
+
+    def test_devin_confirmation_rejections_and_cancel_do_not_write(self):
+        self.cli.session = "kpi-agg"
+        self.core = self.make_core_with_current_session()
+        creation = self.propose("devin")
+        self.assertEqual(self.confirm(creation, user="other").code, "invalid_confirmation")
+        self.assertEqual(self.confirm(creation, chat="chat-b").code, "invalid_confirmation")
+        self.now = creation.expires_at
+        self.assertEqual(self.confirm(creation).code, "confirmation_expired")
+        self.assertEqual(self.confirm(creation).code, "confirmation_used")
+        cancelled = self.propose("devin")
+        self.assertEqual(self.send("/cancel").code, "cancelled")
+        self.assertEqual(self.confirm(cancelled).code, "confirmation_used")
+        self.assertEqual(self.cli.calls, [])
+
+    def make_core_with_current_session(self):
+        self.adapter = self.cli.adapter()
+        return self.make_core()
+
+    def test_devin_confirm_and_restart_never_repeat_successful_creation(self):
+        self.cli.session = "kpi-agg"
+        self.core = self.make_core_with_current_session()
+        creation = self.propose("devin")
+        message = self.message(f"/confirm {creation.confirmation_code}")
+        self.assertEqual(self.core.handle(message).code, "created")
+        binding = self.store.get_binding("chat-a")
+        self.assertEqual(binding.herdr_session, "kpi-agg")
+        self.assertEqual(binding.pane_id, self.cli.created[0][2])
+        self.assertEqual(self.cli.started, [(creation.agent_name, "devin", binding.pane_id)])
+        self.assertEqual(self.core.handle(message).code, "duplicate")
+        self.assertEqual(self.confirm(creation).code, "confirmation_used")
+        calls = list(self.cli.calls)
+        self.store = Store(self.store.path)
+        self.core = self.make_core()
+        self.assertEqual(self.core.handle(message).code, "duplicate")
+        self.assertEqual(self.confirm(creation).code, "confirmation_used")
+        self.assertEqual(self.store.get_binding("chat-a"), binding)
+        self.assertEqual(self.cli.calls, calls)
+
+    def test_devin_collision_regenerates_once_and_persists_final_name(self):
+        occupied, available = "fb-devin-000000000000", "fb-devin-111111111111"
+        self.cli.agents["pane-a"]["name"] = occupied
+        with patch("feishu_herdr_bridge.core.agent_name", side_effect=[occupied, available]) as names:
+            creation = self.propose("devin")
+            self.assertEqual(self.confirm(creation).code, "created")
+        self.assertEqual(names.call_count, 2)
+        self.assertEqual(self.cli.started, [(available, "devin", self.cli.created[0][2])])
+        self.assertEqual(self.store.find_creation(creation.confirmation_code, "chat-a", "user").agent_name,
+                         available)
+        self.assertEqual(self.store.get_binding("chat-a").agent_name, available)
+
+    def test_devin_second_collision_and_racing_conflict_do_not_retry(self):
+        occupied = "fb-devin-000000000000"
+        self.cli.agents["pane-a"]["name"] = occupied
+        with patch("feishu_herdr_bridge.core.agent_name", return_value=occupied) as names:
+            collision = self.propose("devin")
+            self.assertEqual(self.confirm(collision).code, "name_conflict")
+        self.assertEqual(names.call_count, 2)
+        self.assertEqual(self.cli.created, [])
+        racing = self.propose("devin")
+        with patch.object(self.adapter, "start_agent", side_effect=HerdrError("name_conflict")) as start:
+            self.assertEqual(self.confirm(racing).code, "name_conflict")
+            self.assertEqual(self.confirm(racing).code, "confirmation_used")
+        start.assert_called_once_with(racing.agent_name, "devin", self.cli.created[0][2])
+        self.assertEqual(len(self.cli.created), 1)
+        self.assertIsNone(self.store.get_binding("chat-a"))
+
+    def test_devin_start_and_get_each_verify_workspace_pane_and_requested_kind(self):
+        old = self.old_binding()
+        for stage in ("start", "get"):
+            for field, wrong in (("workspace_id", "wrong-workspace"), ("pane_id", "wrong-pane"),
+                                 ("kind", "codex"), ("kind", "claude"), ("kind", "unknown")):
+                with self.subTest(stage=stage, field=field, wrong=wrong):
+                    creation = self.propose("devin")
+                    before = len(self.cli.calls)
+
+                    def tampered(command, timeout):
+                        result = self.cli.run(command, timeout)
+                        if list(command[3:5]) == ["agent", stage]:
+                            payload = json.loads(result.stdout)
+                            agent = payload["result"]["agent"]
+                            if field == "kind":
+                                agent.update(agent=wrong, display_agent=wrong)
+                            else:
+                                agent[field] = wrong
+                            return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+                        return result
+
+                    with patch.object(self.adapter, "_runner", side_effect=tampered):
+                        reply = self.confirm(creation)
+                    expected = "wrong_target" if field == "pane_id" else "start_unverified"
+                    self.assertEqual(reply.code, expected)
+                    # Preserve the existing read-side wrong-target classification.
+                    status = "failed" if stage == "get" and field == "pane_id" else "unknown"
+                    self.assertEqual(reply.status, status)
+                    saved = self.store.find_creation(creation.confirmation_code, "chat-a", "user")
+                    self.assertEqual(saved.status, status)
+                    self.assertEqual((saved.workspace_id, saved.tab_id, saved.pane_id), self.cli.created[-1])
+                    self.assertEqual(self.store.get_binding("chat-a"), old)
+                    calls = self.cli.calls[before:]
+                    self.assertEqual(sum(action == "create" for action, _ in calls), 1)
+                    self.assertEqual(sum(action == "start" for action, _ in calls), 1)
+                    for action, args in calls:
+                        if action == "get":
+                            self.assertEqual(args, ["agent", "get", saved.pane_id])
+                    total = len(self.cli.calls)
+                    self.assertEqual(self.confirm(creation).code, "confirmation_used")
+                    self.assertEqual(len(self.cli.calls), total)
+
+    def test_devin_uncertain_create_or_start_keeps_old_binding_without_replay(self):
+        old = self.old_binding()
+        for stage in ("create", "start"):
+            for mode in ("timeout_after", "malformed_after", "error"):
+                with self.subTest(stage=stage, mode=mode):
+                    creation = self.propose("devin")
+                    before = len(self.cli.calls)
+                    self.cli.modes = {stage: mode}
+                    self.assertEqual(self.confirm(creation).status, "unknown")
+                    self.assertEqual(self.store.find_creation(creation.confirmation_code, "chat-a", "user").status,
+                                     "unknown")
+                    calls = self.cli.calls[before:]
+                    self.assertEqual(sum(action == "create" for action, _ in calls), 1)
+                    self.assertEqual(sum(action == "start" for action, _ in calls), int(stage == "start"))
+                    self.cli.modes = {}
+                    self.store = Store(self.store.path)
+                    self.core = self.make_core()
+                    total = len(self.cli.calls)
+                    self.assertEqual(self.confirm(creation).code, "confirmation_used")
+                    self.assertEqual(len(self.cli.calls), total)
+                    self.assertEqual(self.store.get_binding("chat-a"), old)
+
+    def test_devin_changed_binding_or_project_is_not_retargeted(self):
+        creation = self.propose("devin")
+        self.old_binding()
+        self.assertEqual(self.confirm(creation).code, "binding_changed")
+        creation = self.propose("devin")
+        elsewhere = self.root / "changed-project"
+        elsewhere.mkdir()
+        self.core.projects["demo"] = elsewhere
+        self.assertEqual(self.confirm(creation).code, "project_changed")
+        self.assertEqual(self.cli.calls, [])
+
+    def test_devin_partial_record_recovery_and_persistence_failure_never_resume(self):
+        old = self.old_binding()
+        interrupted = self.propose("devin")
+        self.store.begin_creation(interrupted, self.cli.session, self.now)
+        self.store.save_created_workspace(interrupted.request_id, "fixture-w", "fixture-t", "fixture-p", self.now)
+        self.core = self.make_core()
+        self.assertEqual(self.confirm(interrupted).code, "confirmation_used")
+        self.assertEqual(self.store.find_creation(interrupted.confirmation_code, "chat-a", "user").status,
+                         "unknown")
+        self.assertEqual(self.cli.calls, [])
+        creation = self.propose("devin")
+        with patch.object(self.store, "complete_creation", side_effect=sqlite3.OperationalError("offline failure")):
+            self.assertEqual(self.confirm(creation).status, "unknown")
+        saved = self.store.find_creation(creation.confirmation_code, "chat-a", "user")
+        self.assertEqual((saved.workspace_id, saved.tab_id, saved.pane_id), self.cli.created[0])
+        self.assertEqual(self.store.get_binding("chat-a"), old)
+        self.store = Store(self.store.path)
+        self.core = self.make_core()
+        total = len(self.cli.calls)
+        self.assertEqual(self.confirm(creation).code, "confirmation_used")
+        self.assertEqual(len(self.cli.calls), total)

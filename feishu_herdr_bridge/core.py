@@ -20,7 +20,7 @@ from .store import Binding, BindingChanged, Creation, CreationRejected, GroupReq
 
 _OPERATION_LOCK = threading.Lock()
 _HELP = ("/agents | /bind | /bind <workspace_id> <pane_id> | /read | "
-         "/new <项目别名> <codex或claude> | /group-new <群名> | /confirm <确认码> | /cancel")
+         "/new <项目别名> <codex或claude或devin> | /group-new <群名> | /confirm <确认码> | /cancel")
 
 
 @dataclass(frozen=True)
@@ -447,7 +447,7 @@ class BridgeCore:
 
     def _propose(self, message: Message, args: list[str], snapshot: Binding | None) -> Reply:
         alias, kind = args
-        if kind not in {"codex", "claude"}:
+        if kind not in {"codex", "claude", "devin"}:
             raise CreationRejected("invalid_agent")
         if snapshot is not None and snapshot.herdr_session != self.herdr.session:
             raise CreationRejected("session_changed")
