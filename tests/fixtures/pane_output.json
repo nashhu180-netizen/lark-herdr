@@ -1,0 +1,42 @@
+{
+  "_meta": {
+    "source": "synthetic/not-live",
+    "live_validation": "pending",
+    "note": "These deliberately labelled, fully delimited frames are NOT captures or claimed layouts of Codex, Claude, or Devin. No live layout samples were supplied. Real unrecognized screens must be rejected; do not ask an Agent to print these markers.",
+    "rules": {
+      "frame": "Exact kind-specific synthetic header, BEGIN CONTENT, complete role blocks, END CONTENT, input> footer, state footer; nothing else.",
+      "roles": "USER, ASSISTANT, TOOL, APPROVAL start blocks; END closes each. Every body line starts with '| '. Markers inside a body line remain literal text.",
+      "increment": "Full baseline prefix, or unique baseline-suffix/current-prefix overlap with two nonempty body lines. Only whole new blocks are eligible.",
+      "prompt": "Exactly one newly added USER block, first in the new region, equal to the whole submitted prompt after CRLF and right-padding normalization.",
+      "body": "Only following ASSISTANT blocks. TOOL is excluded, APPROVAL stops extraction. Unknown boundaries never become raw output."
+    }
+  },
+  "layouts": {
+    "codex": {"header": "[synthetic/not-live:codex]", "unrecognized": "Codex\n> ambiguous user/input line\nAn unframed response"},
+    "claude": {"header": "[synthetic/not-live:claude]", "unrecognized": "Claude Code\n> ambiguous user/input line\nAn unframed response"},
+    "devin": {"header": "[synthetic/not-live:devin]", "unrecognized": "Devin\n> ambiguous user/input line\nAn unframed response"}
+  },
+  "history": [
+    {"role": "USER", "lines": ["previous request"]},
+    {"role": "ASSISTANT", "lines": ["previous answer", "previous final line"]}
+  ],
+  "rounds": [
+    {
+      "prompt": "检查第一项\n  保留缩进",
+      "user": {"role": "USER", "lines": ["检查第一项", "  保留缩进"]},
+      "working": {"role": "ASSISTANT", "lines": ["第一轮"]},
+      "assistant": {"role": "ASSISTANT", "lines": ["第一轮正文 α", "", "  保留缩进 👋"]},
+      "expected": "第一轮正文 α\n\n  保留缩进 👋"
+    },
+    {
+      "prompt": "再检查第二项",
+      "user": {"role": "USER", "lines": ["再检查第二项"]},
+      "working": {"role": "ASSISTANT", "lines": ["第二轮"]},
+      "assistant": {"role": "ASSISTANT", "lines": ["第二轮不同正文 β", "完成 é"]},
+      "expected": "第二轮不同正文 β\n完成 é"
+    }
+  ],
+  "tool": {"role": "TOOL", "lines": ["PRIVATE_TOOL_PANEL_MUST_NOT_FORWARD"]},
+  "approval": {"role": "APPROVAL", "lines": ["PRIVATE_APPROVAL_PANEL_MUST_NOT_FORWARD"]},
+  "literal_body": {"role": "ASSISTANT", "lines": ["> this is quoted prose", "- this is a list", "state=idle belongs to the answer", "USER", "  code indentation"]}
+}

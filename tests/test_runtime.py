@@ -306,6 +306,7 @@ root = Path(sys.argv[1])
 class OfflineTransport:
     def __init__(self, credentials): pass
     def send(self, message, reply): pass
+    def send_output_once(self, origin, text): return "failed"
     def start(self, runtime):
         core = runtime.bridge.core
         core.store.bind(chat_id='chat', session='offline-session', workspace_id='workspace-a',
@@ -421,6 +422,9 @@ with patch.object(entry.Path, 'home', return_value=root), patch.object(entry, 'L
             def send(self, message, reply):
                 replies.append(reply)
 
+            def send_output_once(self, origin, text):
+                raise AssertionError("No observation is expected for group creation")
+
             def create_group(self, value):
                 calls.append(value)
                 case.assertFalse(self.is_stopping())
@@ -453,3 +457,112 @@ with patch.object(entry.Path, 'home', return_value=root), patch.object(entry, 'L
             self.assertEqual(entry.main(['--config', str(self.config)], env=self.credentials), 0)
         cli.assert_not_called()
         self.assertEqual(len(calls), 1)
+
+
+class OutputRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        from tests.test_output import CoreRig
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.rig = CoreRig(self.temp.name)
+        self.runner = Mock(spec=ManagedRunner)
+        self.runner.stop.return_value = True
+        self.runtime = entry.BridgeRuntime(self.rig.core, "bot", Mock(), self.runner,
+                                           output_reader=self.rig.herdr, send_output=self.rig.deliver)
+        self.rig.observer = self.runtime.output
+        self.rig.observer._clock = lambda: self.rig.now
+        self.addCleanup(self.runtime.close)
+        for target in ("socket.socket.connect", "socket.socket.connect_ex", "socket.getaddrinfo", "subprocess.Popen"):
+            guard = patch(target, side_effect=AssertionError("Real I/O forbidden"))
+            blocked = guard.start()
+            self.addCleanup(guard.stop)
+            self.addCleanup(blocked.assert_not_called)
+
+    def test_one_loop_stays_asleep_without_work_and_stops_without_scan(self):
+        entered = threading.Event()
+        wait = self.runtime.output._wake.wait
+        delays = []
+        def sleeping(timeout=None):
+            delays.append(timeout)
+            entered.set()
+            return wait(timeout)
+        with patch.object(self.runtime.output._wake, "wait", side_effect=sleeping):
+            self.runtime.start_output()
+            first = self.runtime._output_thread
+            self.runtime.start_output()
+            self.assertIs(self.runtime._output_thread, first)
+            self.assertTrue(entered.wait(2))
+            self.assertEqual(self.rig.calls, [])
+            self.assertEqual(delays, [None])
+            self.runtime.close()
+        self.assertFalse(first.is_alive())
+        self.assertIsNone(self.runtime.receive({"event": "after stop"}))
+        self.assertEqual(self.rig.sent, [])
+
+    def test_close_interrupts_read_and_discards_all_pending_content(self):
+        from tests.test_output import FIXTURE
+        r = self.rig
+        r.send(FIXTURE["rounds"][0]["prompt"], message_id="pending")
+        r.answer()
+        entered, release = threading.Event(), threading.Event()
+        def slow(args):
+            if args[:2] == ["agent", "read"]:
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("fake read")
+        r.before_call = slow
+        self.runner.stop.side_effect = lambda: (release.set() or True)
+        self.runtime.start_output()
+        self.assertTrue(entered.wait(2))
+        self.runtime.close()
+        self.assertFalse(self.runtime._output_thread.is_alive())
+        self.assertEqual(r.sent, [])
+        self.assertEqual(r.observer._active, {})
+        self.assertTrue(r.store.get_binding("chat-a").valid)
+        self.assertEqual(r.store.get_request("pending").status, "done")
+        self.assertEqual(len(r.prompts), 1)
+
+    def test_stop_between_capture_and_arm_does_not_reopen_observation(self):
+        from tests.test_output import FIXTURE
+        r = self.rig
+        def stopping(args):
+            if args[:2] == ["agent", "prompt"]:
+                self.runtime.stopping = True
+        r.before_call = stopping
+        self.assertEqual(r.send(FIXTURE["rounds"][0]["prompt"]).code, "submitted")
+        self.assertEqual(r.observer._active, {})
+        self.assertFalse(r.tick(3))
+        self.assertEqual(r.sent, [])
+        self.assertEqual(len(r.prompts), 1)
+
+    def test_main_configures_readonly_timeout_and_shared_runner(self):
+        directory = Path(self.temp.name)
+        config = directory / "config.json"
+        raw = {"herdr_executable": "/offline/herdr", "herdr_session": "kpi-agg", "bot_open_id": "bot",
+               "allowed_users": ["user"], "allowed_chats": ["chat-a"], "projects": {},
+               "database": str(directory / "main.sqlite3")}
+        case = self
+        class OfflineTransport:
+            def __init__(self, credentials):
+                pass
+            def send(self, message, reply):
+                raise AssertionError("No messages expected")
+            def send_output_once(self, origin, text):
+                raise AssertionError("No output expected")
+            def start(self, runtime):
+                reader = runtime.output._get.__self__
+                foreground = runtime.bridge.core.herdr
+                case.assertEqual(reader._query_timeout, min(raw["query_timeout"], 2.0))
+                case.assertEqual(foreground._query_timeout, raw["query_timeout"])
+                case.assertIs(reader._runner, runtime.runner)
+                case.assertIs(foreground._runner, runtime.runner)
+                case.assertEqual(reader.session, "kpi-agg")
+                case.assertEqual(reader._builder(reader.session, ("agent", "get", "pane-test")),
+                                 ("/offline/herdr", "--session", "kpi-agg", "agent", "get", "pane-test"))
+                case.assertTrue(runtime._output_thread.is_alive())
+        for timeout in (5.0, 0.5):
+            raw["query_timeout"] = timeout
+            config.write_text(json.dumps(raw))
+            with patch.object(entry.Path, "home", return_value=directory), patch.object(entry, "LarkTransport", OfflineTransport):
+                self.assertEqual(entry.main(["--config", str(config)],
+                                            env={"FEISHU_APP_ID": "fixture", "FEISHU_APP_SECRET": "fixture"}), 0)

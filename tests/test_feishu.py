@@ -637,3 +637,279 @@ class GroupSDKTests(unittest.TestCase):
             self.assertNotIn(sensitive, log)
         self.assertNotIn('SECRET', reply.text)
         self.assertEqual(len(self.wire.posts), 1)
+
+
+class OutputHTTPTests(unittest.TestCase):
+    """Pinned SDK models and the real HTTPX send boundary; never live network."""
+
+    def setUp(self):
+        from importlib.metadata import version
+        self.assertIsNotNone(importlib.util.find_spec("lark_oapi"), "Install lark-oapi==1.7.3; do not skip this test")
+        self.assertEqual(version("lark-oapi"), "1.7.3")
+        import httpx
+        from tests.test_output import CoreRig
+        from feishu_herdr_bridge import output
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.rig = CoreRig(self.temp.name)
+        self.transport = LarkTransport(Credentials("fixture-app", "fixture-secret"))
+        self.posts, self.auth, self.models = [], [], []
+        self.status = 200
+        self.failure = None
+        self.payload = None
+        self.stopped = False
+        self.after_token = self.after_message = lambda: None
+        self.transport.is_stopping = lambda: self.stopped
+        self.rig.observer = output.connect_output(self.rig.core, self.rig.herdr,
+                                                  self.transport.send_output_once, clock=lambda: self.rig.now)
+        for target in ("socket.socket.connect", "socket.socket.connect_ex", "socket.getaddrinfo"):
+            guard = patch(target, side_effect=AssertionError("Real network is forbidden"))
+            blocked = guard.start()
+            self.addCleanup(guard.stop)
+            self.addCleanup(blocked.assert_not_called)
+        from feishu_herdr_bridge.feishu import build_text_request
+        def model(*args):
+            request = build_text_request(*args)
+            self.models.append(request)
+            return request
+        guarded_model = patch("feishu_herdr_bridge.feishu.build_text_request", side_effect=model)
+        guarded_model.start()
+        self.addCleanup(guarded_model.stop)
+        # Resolve the real class before wraps replaces the module attribute;
+        # handle_async_request must be patched on the class instances get.
+        real_transport = httpx.AsyncHTTPTransport
+        transport_factory = patch("httpx.AsyncHTTPTransport", wraps=real_transport)
+        self.transports = transport_factory.start()
+        self.addCleanup(transport_factory.stop)
+        violations = []
+        async def boundary(transport, request):
+            try:
+                self.assertEqual(request.method, "POST")
+                self.assertEqual(request.url.host, "open.feishu.cn")
+                if request.url.path.endswith("/tenant_access_token/internal"):
+                    self.auth.append(request)
+                    self.assertEqual(json.loads(request.content), {"app_id": "fixture-app", "app_secret": "fixture-secret"})
+                    self.after_token()
+                    return httpx.Response(200, json={"code": 0, "tenant_access_token": "fixture-tenant-token"}, request=request)
+                self.assertEqual(request.url.path, "/open-apis/im/v1/messages")
+                self.assertEqual(dict(request.url.params), {"receive_id_type": "chat_id"})
+                self.assertEqual(request.headers["Authorization"], "Bearer fixture-tenant-token")
+                self.posts.append(request)
+                if self.failure is not None:
+                    if callable(self.failure):
+                        await self.failure()
+                    else:
+                        raise self.failure
+                self.after_message()
+                body = json.loads(request.content)
+                data = self.payload or {"code": 0, "data": {"chat_id": body["receive_id"], "message_id": "fixture-message"}}
+                if isinstance(data, bytes):
+                    return httpx.Response(self.status, content=data, request=request)
+                return httpx.Response(self.status, json=data, request=request,
+                                      headers={"Location": "https://open.feishu.cn/open-apis/im/v1/messages"})
+            except AssertionError as error:
+                violations.append(str(error))
+                raise
+        network = patch.object(real_transport, "handle_async_request", new=boundary)
+        network.start()
+        self.addCleanup(network.stop)
+        self.addCleanup(lambda: self.assertEqual(violations, []))
+        # A real SDK WebSocket supplies this loop in production. This test starts
+        # only a local event loop; no SDK WebSocket or external connection starts.
+        import asyncio
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+        def run_loop():
+            asyncio.set_event_loop(loop)
+            loop.call_soon(ready.set)
+            loop.run_forever()
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+        worker = threading.Thread(target=run_loop, daemon=True)
+        worker.start()
+        self.assertTrue(ready.wait(2))
+        self.transport._loop = loop
+        def close_loop():
+            loop.call_soon_threadsafe(loop.stop)
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+        self.addCleanup(close_loop)
+
+    def complete_round(self, index=0, message_id="source", history=None):
+        from tests.test_output import FIXTURE, screen
+        r = self.rig
+        r.screens["pane-a"] = screen("devin", FIXTURE["history"] if history is None else history)
+        self.assertEqual(r.send(FIXTURE["rounds"][index]["prompt"], message_id=message_id).code, "submitted")
+        r.answer(index, history=history)
+        r.tick()
+        r.tick(2)
+
+    def test_two_turns_use_real_models_tenant_identity_and_two_message_posts(self):
+        from tests.test_output import FIXTURE
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+        from lark_oapi.core.enum import AccessTokenType
+
+        first, second = FIXTURE["rounds"]
+        self.complete_round(message_id="p1")
+        self.complete_round(1, "p2", FIXTURE["history"] + [first["user"], first["assistant"]])
+        self.assertEqual(len(self.posts), 2)
+        self.assertEqual(len(self.auth), 2)
+        self.assertEqual([json.loads(json.loads(p.content)["content"])["text"] for p in self.posts],
+                         ["主控 Pane pane-a\n" + first["expected"], "主控 Pane pane-a\n" + second["expected"]])
+        for request in self.models:
+            self.assertIsInstance(request, CreateMessageRequest)
+            self.assertIsInstance(request.body, CreateMessageRequestBody)
+            self.assertEqual(request.token_types, {AccessTokenType.TENANT})
+            self.assertEqual(request.body.receive_id, "chat-a")
+        self.assertTrue(all(c.kwargs == {"retries": 0} for c in self.transports.call_args_list))
+        self.assertEqual(self.rig.send(first["prompt"], message_id="p1").code, "duplicate")
+        self.assertEqual(self.rig.send(second["prompt"], message_id="p2").code, "duplicate")
+        self.rig.tick(200)
+        self.assertEqual(len(self.posts), 2)
+        self.assertEqual(len(self.rig.prompts), 2)
+        self.assertTrue(all(self.rig.store.get_request(key).status == "done" for key in ("p1", "p2")))
+
+    def test_http_errors_redirects_disconnect_and_bad_response_do_not_retry(self):
+        import httpx
+        cases = [(code, None, None) for code in (301, 302, 307, 308, 403, 429, 500, 503)]
+        cases += [(200, httpx.ReadTimeout("PRIVATE"), None), (200, httpx.ConnectError("PRIVATE"), None),
+                  (200, None, b'{'), (200, None, {"code": 0, "data": {"message_id": "fixture"}}),
+                  (200, None, {"code": 0, "data": {"chat_id": "wrong-chat", "message_id": "fixture"}})]
+        for index, (status, error, payload) in enumerate(cases):
+            with self.subTest(index=index):
+                self.status, self.failure, self.payload = status, error, payload
+                before = len(self.posts)
+                source = f"fault-{index}"
+                self.complete_round(message_id=source)
+                self.rig.tick(130)
+                self.assertEqual(self.rig.send("duplicate", message_id=source).code, "duplicate")
+                self.assertEqual(len(self.posts), before + 1)
+                self.assertTrue(self.rig.store.get_binding("chat-a").valid)
+                self.assertEqual(self.rig.store.get_request(source).status, "done")
+                self.assertEqual(self.rig.observer._active, {})
+
+    def test_stop_after_auth_skips_message_and_inflight_stop_is_unknown(self):
+        self.after_token = lambda: setattr(self, "stopped", True)
+        self.complete_round(message_id="auth-stop")
+        self.assertEqual(len(self.auth), 1)
+        self.assertEqual(self.posts, [])
+        self.stopped = False
+        self.after_token = lambda: None
+        self.after_message = lambda: setattr(self, "stopped", True)
+        self.complete_round(message_id="inflight-stop")
+        self.assertEqual(len(self.posts), 1)
+        self.stopped = False
+        self.assertEqual(self.rig.send("duplicate", message_id="inflight-stop").code, "duplicate")
+        self.rig.tick(130)
+        self.assertEqual(len(self.posts), 1)
+
+    def test_total_timeout_cancels_pending_http_without_background_retry(self):
+        import asyncio
+        import time
+        cancelled = threading.Event()
+        async def held():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        self.failure = held
+        start = time.monotonic()
+        self.complete_round(message_id="timeout")
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 4.5)
+        self.assertTrue(cancelled.wait(1))
+        self.assertEqual(len(self.posts), 1)
+        self.rig.tick(130)
+        self.assertEqual(self.rig.send("duplicate", message_id="timeout").code, "duplicate")
+        self.assertEqual(len(self.posts), 1)
+
+    def test_private_payloads_and_exceptions_never_enter_audit_or_failure_reply(self):
+        import httpx
+        self.failure = httpx.ReadError("PRIVATE-token PRIVATE-chat PRIVATE-prompt")
+        with self.assertLogs("feishu_herdr_bridge.output", level="INFO") as logs:
+            self.complete_round(message_id="PRIVATE-source")
+        text = "\n".join(logs.output)
+        for secret in ("PRIVATE", "fixture-secret", "fixture-tenant-token", "chat-a", "pane-a"):
+            self.assertNotIn(secret, text)
+        self.assertEqual(len(self.rig.receipts), 1)  # Original submission only; no failure echo.
+        self.assertEqual(self.rig.receipts[0][1].code, "submitted")
+
+
+class OutputSendGuardTests(unittest.TestCase):
+    def test_stopped_or_invalid_destination_never_enters_http_or_sdk(self):
+        from dataclasses import replace
+        from feishu_herdr_bridge.output import Origin
+        transport = LarkTransport.__new__(LarkTransport)
+        transport.is_stopping = lambda: True
+        origin = Origin("source", "chat", "user", "kpi-agg", "workspace", "pane", 1, "bot", "devin", "group")
+        with patch.object(transport, "_output_post") as http:
+            self.assertEqual(transport.send_output_once(origin, "text"), "failed")
+            transport.is_stopping = lambda: False
+            for bad in (replace(origin, session="other"), replace(origin, chat_type="p2p")):
+                self.assertEqual(transport.send_output_once(bad, "text"), "failed")
+            self.assertEqual(transport.send_output_once(origin, "x" * 3001), "failed")
+            self.assertEqual(transport.send_output_once(origin, "\x1b[31m"), "failed")
+            http.assert_not_called()
+
+    def test_expired_send_waiting_for_sdk_loop_is_cancelled_without_running_http(self):
+        import asyncio
+        import time
+        from feishu_herdr_bridge.output import Origin
+        loop = asyncio.new_event_loop()
+        entered, release = threading.Event(), threading.Event()
+        ran = []
+        transport = LarkTransport.__new__(LarkTransport)
+        transport.is_stopping = lambda: False
+        transport._loop = loop
+        origin = Origin("source", "chat", "user", "kpi-agg", "workspace", "pane", 1, "bot", "devin", "group")
+        def blocked_callback():
+            entered.set()
+            release.wait(5)
+        def run_loop():
+            asyncio.set_event_loop(loop)
+            loop.call_soon(blocked_callback)
+            loop.run_forever()
+            tasks = asyncio.all_tasks(loop)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+            loop.close()
+        original_post = transport._output_post
+        errors = []
+        async def http(*args):
+            try:
+                result = await original_post(*args)
+                ran.append(result)
+                return result
+            except BaseException as error:
+                errors.append(type(error).__name__)
+                raise
+        async def drained():
+            pass
+        worker = threading.Thread(target=run_loop, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            with patch.object(transport, "_output_post", new=http), \
+                    patch("feishu_herdr_bridge.feishu.build_text_request") as build:
+                start = time.monotonic()
+                self.assertEqual(transport.send_output_once(origin, "text"), "unknown")
+                self.assertLess(time.monotonic() - start, 4.5)
+                release.set()
+                asyncio.run_coroutine_threadsafe(drained(), loop).result(timeout=2)
+                # Cancellation can race task startup. The real method must
+                # reject an expired budget before even building an SDK request.
+                self.assertTrue(all(result == "failed" for result in ran))
+                self.assertEqual(errors, [])
+                build.assert_not_called()
+        finally:
+            release.set()
+            loop.call_soon_threadsafe(loop.stop)
+            worker.join(3)
+            self.assertFalse(worker.is_alive())

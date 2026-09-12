@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 from uuid import UUID
@@ -19,6 +20,7 @@ from .core import (
     BridgeCore, GroupCreateError, GroupCreateInput, GroupCreateResult, Message, Prepared, Reply,
 )
 from .herdr import safe_identifier, safe_text
+from .output import MAX_CHARS, MAX_LINES, Origin
 
 
 _LOG = logging.getLogger(__name__)
@@ -284,6 +286,76 @@ class LarkTransport:
             raise GroupCreateError(created_chat_id=result.created_chat_id, uncertain=sent) from None
         finally:
             _GROUP_CREATE_LOCK.release()
+
+    def send_output_once(self, origin: Origin, text: str) -> str:
+        """Wait for one guarded send; never use the fire-and-forget receipt path."""
+        if (self.is_stopping() or origin.session != "kpi-agg" or origin.chat_type != "group"
+                or not safe_identifier(origin.chat_id) or not safe_text(text) or not text.strip()
+                or len(text) > MAX_CHARS or len(text.split("\n")) > MAX_LINES):
+            return "failed"
+        loop = self._loop
+        if loop is None or loop.is_closed() or not loop.is_running():
+            return "failed"
+        try:
+            if asyncio.get_running_loop() is loop:
+                return "failed"  # This blocking API belongs only to the observer thread.
+        except RuntimeError:
+            pass
+        deadline = time.monotonic() + 3.0
+        coroutine = self._output_post(origin, text, deadline)
+        future = None
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+            return future.result(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            return "unknown"  # No raw exception, replay, or failure receipt.
+        finally:
+            if future is None:
+                coroutine.close()
+            elif not future.done():
+                future.cancel()  # A late-starting coroutine also checks the absolute deadline.
+
+    async def _output_post(self, origin: Origin, text: str, deadline: float) -> str:
+        if self.is_stopping() or time.monotonic() >= deadline:
+            return "failed"
+        import httpx  # Already a dependency of the pinned SDK.
+        from lark_oapi.core.enum import AccessTokenType
+
+        # SDK acreate performs synchronous token verification. Avoid that path
+        # here: token acquisition AND message delivery share a cancellable budget.
+        # Reuse the real SDK text model/serializer, not its retry/redirect path.
+        async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+            request = build_text_request(origin.chat_id, text)
+            request.token_types = {AccessTokenType.TENANT}
+            body = json.loads(self._lark.JSON.marshal(request.body))
+            async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0),
+                                         follow_redirects=False, timeout=3.0) as client:
+                if self.is_stopping() or time.monotonic() >= deadline:
+                    return "failed"
+                token_response = await client.post(
+                    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                    json={"app_id": self._credentials.app_id, "app_secret": self._credentials.app_secret},
+                )
+                token_data = token_response.json()
+                if (token_response.status_code != 200 or not isinstance(token_data, dict)
+                        or type(token_data.get("code")) is not int or token_data["code"] != 0
+                        or not safe_identifier(token_data.get("tenant_access_token"))):
+                    return "failed"  # No message POST was attempted.
+                if self.is_stopping() or time.monotonic() >= deadline:
+                    return "failed"
+                response = await client.post(
+                    "https://open.feishu.cn/open-apis/im/v1/messages",
+                    params={"receive_id_type": "chat_id"}, json=body,
+                    headers={"Authorization": "Bearer " + token_data["tenant_access_token"]},
+                )
+                data = response.json()
+                if (self.is_stopping() or not 200 <= response.status_code < 300
+                        or not isinstance(data, dict) or type(data.get("code")) is not int
+                        or data["code"] != 0 or not isinstance(data.get("data"), dict)
+                        or data["data"].get("chat_id") != origin.chat_id
+                        or not safe_identifier(data["data"].get("message_id"))):
+                    return "unknown"
+                return "sent"
 
     def send(self, message: Message, reply: Reply) -> None:
         if self._loop is None or self._loop.is_closed():

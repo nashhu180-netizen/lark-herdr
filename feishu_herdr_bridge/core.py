@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Collection, Mapping
 from uuid import uuid4
 
+from .output import Observation, Origin, OutputObserver
 from .herdr import Agent, HerdrAdapter, HerdrError, Workspace, safe_identifier, safe_text, valid_agent_name
 from .store import Binding, BindingChanged, Creation, CreationRejected, GroupRequest, Store, WorkspaceOccupied
 
@@ -90,6 +91,8 @@ class BridgeCore:
         self.allowed_users = frozenset(allowed_users)
         self.clock = clock
         self.projects = dict(projects or {})
+        self.output: OutputObserver | None = None
+        self._output_capture: Observation | None = None
         self.management_chat_id = management_chat_id
         self.admin_users = frozenset(admin_users)
         self.bot_open_id = bot_open_id
@@ -186,6 +189,7 @@ class BridgeCore:
         message, action, args, snapshot = (
             prepared.message, prepared.action, prepared.args, prepared.snapshot
         )
+        self._output_capture = None
         try:
             try:
                 if self._authorized_action(message, action):
@@ -210,8 +214,26 @@ class BridgeCore:
                 # Never expose exception repr: it may contain a prompt or CLI output.
                 self._invalidate_quietly(snapshot, action)
                 reply = Reply("unknown", "internal_error", "操作结果不明，未自动重试，请检查现场。")
-            return self._record(message, snapshot, action, reply)
+            recorded = self._record(message, snapshot, action, reply)
+            if action == "prompt" and recorded.status == "done" and recorded.code == "submitted":
+                enabled = False
+                try:
+                    if self.output is not None and self._output_capture is not None:
+                        enabled = self.output.arm(self._output_capture)
+                except Exception:
+                    pass  # Auxiliary observation must never change submission success.
+                if enabled:
+                    self._output_capture = None
+                elif self.output is not None and message.chat_type == "group":
+                    recorded = replace(recorded, text=recorded.text + "本次自动回传未启用，可用 /read。")
+            return recorded
         finally:
+            try:
+                if self.output is not None and self._output_capture is not None:
+                    self.output.cancel(self._output_capture)
+            except Exception:
+                self._stop_output()
+            self._output_capture = None
             self._lock.release()
 
     def _record(self, message: Message, snapshot: Binding | None, action: str, reply: Reply) -> Reply:
@@ -264,6 +286,8 @@ class BridgeCore:
             return Reply("failed", action, "文本为空或含终端控制字符，未投递。")
         if action == "unknown_command":
             return Reply("failed", action, f"支持：{_HELP}。其他斜杠命令不会透传。")
+        if action == "read":
+            self._cancel_output(message.chat_id)
         if action == "group_new":
             return self._propose_group(message, args[0])
         if action == "group_confirm":
@@ -347,8 +371,38 @@ class BridgeCore:
             truncated = len(lines) > 80 or len(content) > 3000
             content = content[:3000]
             return Reply("done", "read", f"{label}\n{content}" + ("\n[输出已截断]" if truncated else ""))
+        self._capture_output(message, snapshot, agent)
+        self._assert_current(snapshot)  # Capture added reads; never bypass a changed binding.
         self.herdr.prompt(snapshot.pane_id, message.text)
         return Reply("done", "submitted", f"{label}已提交，尚未确认任务完成。")
+
+    def _stop_output(self) -> None:
+        try:
+            if self.output is not None:
+                self.output.request_stop()
+        except Exception:
+            pass
+
+    def _cancel_output(self, chat_id: str) -> None:
+        try:
+            if self.output is not None:
+                self.output.cancel_current(chat_id)
+        except Exception:
+            self._stop_output()  # Do not leave an old round live after a broken cancellation.
+
+    def _capture_output(self, message: Message, binding: Binding, agent: Agent) -> None:
+        if self.output is None:
+            return
+        self._cancel_output(message.chat_id)
+        if message.chat_type != "group":
+            return
+        origin = Origin(message.message_id, message.chat_id, message.user_id,
+                        binding.herdr_session, binding.workspace_id, binding.pane_id,
+                        binding.revision, self.bot_open_id, agent.kind, message.chat_type)
+        try:
+            self._output_capture = self.output.capture(origin, message.text)
+        except Exception:
+            self._cancel_output(message.chat_id)
 
     def _propose_group(self, message: Message, name: str) -> Reply:
         if not 1 <= len(name) <= 60:
