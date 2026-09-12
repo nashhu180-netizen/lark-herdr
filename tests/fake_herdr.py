@@ -169,6 +169,10 @@ def main() -> int:
             return 0
         output()
         return 0
+    if action == "send-keys" and args[3:] == ["enter"]:
+        record("key", workspace_id=agent["workspace_id"], pane_id=pane_id, key="enter")
+        output()
+        return 0
     output(False, error="rejected")
     return 2
 

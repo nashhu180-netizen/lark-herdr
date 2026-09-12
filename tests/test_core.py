@@ -117,6 +117,26 @@ class CoreTests(unittest.TestCase):
         prompt = [e for e in self.fake.events("call") if e["argv"][1] == "prompt"][0]
         self.assertEqual(prompt["argv"], ["agent", "prompt", "pane-a", body])
 
+    def test_working_devin_exact_queue_is_confirmed_once(self):
+        state = self.fake.load()
+        agent = state["sessions"][SESSION]["agents"]["pane-a"]
+        agent.update(kind="devin", status="working")
+        rule_top = "─" * 40 + " (bypass permissions on) ─"
+        rule_bottom = "─" * 46
+        status = "SWE-2 Max" + " " * 24 + "Context: 120k / 262k tokens (46%)"
+        prompt = "测试自动回复"
+        state["sessions"][SESSION]["screens"]["pane-a"] = "\n".join([
+            " ⏺ Existing work", "", "⠀⢸ Running tools · 1m 0s (esc twice to interrupt)",
+            "── 1 queued " + "─" * 20 + " ↑ edit · ↵ send now ──", "○ " + prompt,
+            rule_top, "❭ Press Enter to send queued messages now", rule_bottom, status,
+            "3 subagents · ↓ select", "",
+        ])
+        self.fake.save(state)
+        self.bind()
+        self.assertEqual(self.send(prompt).code, "submitted")
+        self.assertEqual([(e["pane_id"], e["key"]) for e in self.fake.events("key")],
+                         [("pane-a", "enter")])
+
     def test_leading_hyphen_is_rejected_until_live_verified(self):
         self.bind()
         self.assertEqual(self.send("--wait").code, "leading_hyphen_unverified")

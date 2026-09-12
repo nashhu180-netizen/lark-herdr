@@ -75,6 +75,8 @@ _DEVIN_ACTIVITY = re.compile(
     r"(?:(?:[1-9][0-9]* subagents?)(?: · [1-9][0-9]* shells?)?"
     r"|[1-9][0-9]* shells?) · ↓ select"
 )
+_DEVIN_QUEUE_RULE = re.compile(r"── 1 queued ─+ ↑ edit · ↵ send now ──")
+_DEVIN_QUEUE_INPUT = "❭ Press Enter to send queued messages now"
 _DEVIN_TOOL_HEAD = re.compile(r" [○◐◔◑◕⏺] ")
 _DEVIN_USER_CONT = re.compile(r"  \S")
 _DEVIN_TOOL_BODY = ("│", " │", " └")
@@ -95,7 +97,13 @@ def _devin_frame(lines: list[str]) -> _Frame | None:
             or _DEVIN_RULE_TOP.fullmatch(lines[chrome_end - 4]) is None):
         return None
     end, status = chrome_end - 4, "idle"
-    if end > 0 and _DEVIN_SPINNER.search(lines[end - 1]):
+    if lines[chrome_end - 3] == _DEVIN_QUEUE_INPUT:
+        if (end < 3 or _DEVIN_SPINNER.search(lines[end - 3]) is None
+                or _DEVIN_QUEUE_RULE.fullmatch(lines[end - 2]) is None
+                or not lines[end - 1].startswith("○ ") or not lines[end - 1][2:].strip()):
+            return None
+        status, end = "working", end - 3
+    elif end > 0 and _DEVIN_SPINNER.search(lines[end - 1]):
         status, end = "working", end - 1
     if lines[chrome_end - 3] == "❭ Guide Devin while it works":
         status = "working"  # Working placeholder; same signal the agent detector uses.
@@ -147,6 +155,29 @@ def _devin_frame(lines: list[str]) -> _Frame | None:
             return None
         i = j
     return _Frame(tuple("| " + row.rstrip() for row in transcript), tuple(blocks), status, True)
+
+
+def queued_devin_prompt(raw: str, prompt: str) -> bool:
+    """Recognize one exact Devin guidance queue entry before sending Enter."""
+    text, expected = _text(raw), _prompt(prompt)
+    if text is None or expected is None or "\n" in expected:
+        return False
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    chrome_end = len(lines)
+    if lines and _DEVIN_ACTIVITY.fullmatch(lines[-1]) is not None:
+        chrome_end -= 1
+    if (chrome_end < 7 or lines[chrome_end - 3] != _DEVIN_QUEUE_INPUT
+            or _DEVIN_STATUS.fullmatch(lines[chrome_end - 1]) is None
+            or _DEVIN_RULE.fullmatch(lines[chrome_end - 2]) is None
+            or _DEVIN_RULE_TOP.fullmatch(lines[chrome_end - 4]) is None):
+        return False
+    end = chrome_end - 4
+    return (end >= 3 and _DEVIN_SPINNER.search(lines[end - 3]) is not None
+            and _DEVIN_QUEUE_RULE.fullmatch(lines[end - 2]) is not None
+            and lines[end - 1] == "○ " + expected
+            and _devin_frame(lines) is not None)
 
 
 def _text(value: str) -> str | None:
