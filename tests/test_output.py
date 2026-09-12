@@ -38,10 +38,10 @@ DEVIN_HISTORY = [
 ]
 
 
-def devin_screen(transcript, status="idle", input_text=None):
+def devin_screen(transcript, status="idle", input_text=None, spinner=DEVIN_SPINNER):
     lines = list(transcript) + [""]
     if status == "working":
-        lines.append(DEVIN_SPINNER)
+        lines.append(spinner)
     lines.extend([DEVIN_RULE_TOP, "❭ " + (input_text if input_text is not None else DEVIN_IDLE_INPUT[2:]),
                   DEVIN_RULE_BOTTOM, DEVIN_STATUS])
     return "\n".join(lines) + "\n"
@@ -363,6 +363,84 @@ class RealDevinExtractionTests(unittest.TestCase):
             rig.tick(2.0)
         self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\n" + out.NOTICE)])
         self.assertEqual(watch.phase, "consumed")
+
+    def test_working_spinner_hint_optional_suffix_is_working_chrome(self):
+        # Issue #16: the observed working footer may carry an optional suffix
+        # after the interrupt hint; it must still parse as a working frame.
+        before = devin_screen(DEVIN_HISTORY)
+        for hint in ("(esc twice to interrupt)", "(esc twice to interrupt · tab to queue)",
+                     "(esc to interrupt · enter sends queued)", "(esc again to interrupt) "):
+            spinner = "⠸ Running tools · 0m 3s " + hint
+            with self.subTest(hint=hint):
+                after = devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " partial"],
+                                     status="working", spinner=spinner)
+                result = out.extract_new_text("devin", before, after, self.PROMPT)
+                self.assertIsNone(result.body)
+                self.assertEqual(result.reason, "not_ready")
+
+    def test_guidance_sent_while_working_arms_and_sends_final_body(self):
+        # Issue #16: a prompt submitted while the bound pane is working still
+        # captures a baseline and eventually returns one verified final body.
+        from dataclasses import replace
+        rig = Rig()
+        origin = rig.origin()
+        rig.states[origin.pane_id] = replace(rig.states[origin.pane_id], status="working")
+        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY, status="working")
+        watch = rig.arm(origin, self.PROMPT)
+        self.assertIsNotNone(watch)
+        # Turn streams past the baseline, then our echo, then the final answer.
+        rig.screens[origin.pane_id] = devin_screen(
+            DEVIN_HISTORY + ["", " ⏺ Ran command", " │ $ long work", " └ Exited with code 0",
+                             "", "❭ " + self.PROMPT, "", " P1_LIVE_OK"])
+        rig.states[origin.pane_id] = replace(rig.states[origin.pane_id], status="done")
+        self.assertTrue(rig.tick())
+        self.assertEqual(rig.messages, [])
+        rig.tick(2.0)
+        self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\nP1_LIVE_OK")])
+        self.assertEqual((watch.phase, watch.reason), ("consumed", "sent"))
+
+    def test_newer_guidance_supersedes_watch_and_owns_the_reply(self):
+        # Issue #16: a second guidance message while working cancels the prior
+        # watch and owns the single eventual verified reply.
+        from dataclasses import replace
+        rig = Rig()
+        o1 = rig.origin(message="m1")
+        rig.states[o1.pane_id] = replace(rig.states[o1.pane_id], status="working")
+        rig.screens[o1.pane_id] = devin_screen(DEVIN_HISTORY, status="working")
+        w1 = rig.arm(o1, "仅回复：P1_LIVE_OK")
+        self.assertIsNotNone(w1)
+        o2 = rig.origin(message="m2")
+        rig.screens[o2.pane_id] = devin_screen(
+            DEVIN_HISTORY + ["", "❭ 仅回复：P1_LIVE_OK"], status="working")
+        w2 = rig.arm(o2, "仅回复：P2_LIVE_OK")
+        self.assertIsNotNone(w2)
+        self.assertEqual(w1.phase, "closed")
+        rig.states[o2.pane_id] = replace(rig.states[o2.pane_id], status="idle")
+        rig.screens[o2.pane_id] = devin_screen(
+            DEVIN_HISTORY + ["", "❭ 仅回复：P1_LIVE_OK", "", " partial answer",
+                             "", "❭ 仅回复：P2_LIVE_OK", "", " P2_LIVE_OK"])
+        rig.tick()
+        rig.tick(2.0)
+        self.assertEqual(rig.messages, [(o2, f"主控 Pane {o2.pane_id}\nP2_LIVE_OK")])
+        self.assertEqual((w2.phase, w2.reason), ("consumed", "sent"))
+
+    def test_guidance_body_excludes_output_streamed_before_the_echo(self):
+        # With a working baseline the in-flight output before our echo must not
+        # be attributed to the guidance message.
+        before = devin_screen(DEVIN_HISTORY, status="working")
+        after = devin_screen(DEVIN_HISTORY + ["", " pre-echo streamed text",
+                                            "", "❭ " + self.PROMPT, "", " P1_LIVE_OK"])
+        result = out.extract_new_text("devin", before, after, self.PROMPT)
+        self.assertEqual(result.body, "P1_LIVE_OK")
+        self.assertNotIn("pre-echo", result.body)
+
+    def test_working_baseline_still_rejects_foreign_or_double_echo(self):
+        before = devin_screen(DEVIN_HISTORY, status="working")
+        foreign = devin_screen(DEVIN_HISTORY + ["", "❭ somebody else", "", " answer"])
+        self.assertIsNone(out.extract_new_text("devin", before, foreign, self.PROMPT).body)
+        doubled = devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " mid",
+                                              "", "❭ foreign", "", " P1_LIVE_OK"])
+        self.assertIsNone(out.extract_new_text("devin", before, doubled, self.PROMPT).body)
 
 
 class FormatTests(unittest.TestCase):
@@ -689,18 +767,24 @@ class ObserverTests(unittest.TestCase):
             self.assertTrue(text.startswith(f"主控 Pane {origin.pane_id}\n"))
         self.assertEqual(set(r.calls), {("get", "pane-a"), ("read", "pane-a"), ("get", "pane-b"), ("read", "pane-b")})
 
-    def test_new_working_prompt_cancels_old_without_arming_a_mixed_round(self):
+    def test_new_working_prompt_recaptures_baseline_and_supersedes_old_round(self):
         from dataclasses import replace
         r = self.rig
         p1 = r.origin()
         w1 = r.arm(p1)
         p2 = r.origin(message="m2")
         r.states[p2.pane_id] = replace(r.states[p2.pane_id], status="working")
-        self.assertIsNone(r.arm(p2, FIXTURE["rounds"][1]["prompt"]))
+        w2 = r.arm(p2, FIXTURE["rounds"][1]["prompt"])
+        self.assertIsNotNone(w2)
         self.assertEqual(w1.phase, "closed")
         r.answer(p1)
         r.tick(10)
-        self.assertEqual(r.messages, [])
+        self.assertEqual(r.messages, [])  # Working polls skip reads entirely.
+        self.assertEqual(w2.phase, "watching")
+        # Content without the new echo is never attributed to the newer prompt.
+        r.states[p2.pane_id] = replace(r.states[p2.pane_id], status="idle")
+        r.tick(2.0)
+        self.assertEqual(r.messages, [(p2, "主控 Pane pane-a\n" + out.NOTICE)])
         self.assertEqual(r.invalidated, [])
 
     def test_cancel_and_old_handle_cleanup_never_remove_new_round(self):
@@ -773,9 +857,9 @@ class ObserverTests(unittest.TestCase):
                 self.assertNotIn("PRIVATE", repr(r.logs))
                 self.assertTrue(all(pane == origin.pane_id for _, pane in r.calls))
 
-    def test_baseline_errors_working_and_budgets_only_disable_capture(self):
+    def test_baseline_errors_and_budgets_only_disable_capture(self):
         from dataclasses import replace
-        for mode in ("read_failure", "get_failure", "working", "unknown", "raw", "prompt"):
+        for mode in ("read_failure", "get_failure", "unknown", "blocked", "raw", "prompt"):
             with self.subTest(mode=mode):
                 r = Rig()
                 origin = r.origin()
@@ -786,7 +870,7 @@ class ObserverTests(unittest.TestCase):
                     r.on_read = fail
                 elif mode == "get_failure":
                     r.on_get = fail
-                elif mode in {"working", "unknown"}:
+                elif mode in {"unknown", "blocked"}:
                     r.states[origin.pane_id] = replace(r.states[origin.pane_id], status=mode)
                 elif mode == "raw":
                     r.screens[origin.pane_id] = "x" * (out.MAX_BYTES + 1)
@@ -1248,21 +1332,23 @@ class CoreOutputIntegrationTests(unittest.TestCase):
         self.assertEqual(len(r.prompts), 1)
         self.assertTrue(r.store.get_binding("chat-a").valid)
 
-    def test_working_next_prompt_and_manual_read_cancel_only_their_chat(self):
+    def test_working_next_prompt_arms_guidance_and_manual_read_cancels_only_its_chat(self):
         r = self.connect()
         first = FIXTURE["rounds"][0]
         r.send(first["prompt"])
         r.send(first["prompt"], chat="chat-b")
         r.status = "working"
         self.assertEqual(r.send("next task").code, "submitted")
-        self.assertNotIn("chat-a", r.observer._active)
+        self.assertIn("chat-a", r.observer._active)  # Guidance watch armed.
         self.assertIn("chat-b", r.observer._active)
         r.status = "idle"
         self.assertEqual(r.send("/read", chat="chat-b").code, "read")
-        self.assertEqual(r.observer._active, {})
+        self.assertEqual(set(r.observer._active), {"chat-a"})
         r.answer()
         r.tick(5)
-        self.assertEqual(r.sent, [])
+        # The stale answer does not echo the guidance text: one safe notice.
+        self.assertEqual([(o.chat_id, text) for o, text in r.sent],
+                         [("chat-a", "主控 Pane pane-a\n" + out.NOTICE)])
 
     def test_two_chats_poll_only_frozen_targets(self):
         r = self.connect()
