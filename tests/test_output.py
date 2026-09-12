@@ -428,7 +428,7 @@ class RealDevinExtractionTests(unittest.TestCase):
                 self.assertEqual(out.extract_new_text("devin", before, after, self.PROMPT).reason,
                                  "unrecognized")
 
-    def test_single_exact_queued_guidance_is_working_chrome_and_confirmable(self):
+    def test_single_exact_queued_guidance_is_working_chrome_and_waits_fail_closed(self):
         before = devin_screen(DEVIN_HISTORY)
         queued = devin_queued_screen(
             DEVIN_HISTORY, self.PROMPT, "3 subagents · ↓ select"
@@ -436,14 +436,36 @@ class RealDevinExtractionTests(unittest.TestCase):
         result = out.extract_new_text("devin", before, queued, self.PROMPT)
         self.assertIsNone(result.body)
         self.assertEqual(result.reason, "not_ready")
-        self.assertTrue(out.queued_devin_prompt(queued, self.PROMPT))
-        self.assertFalse(out.queued_devin_prompt(queued, "different guidance"))
-        self.assertFalse(out.queued_devin_prompt(queued, self.PROMPT + "\nextra"))
 
         malformed = queued.replace("── 1 queued ", "── 2 queued ", 1)
         self.assertEqual(out.extract_new_text("devin", before, malformed, self.PROMPT).reason,
                          "unrecognized")
-        self.assertFalse(out.queued_devin_prompt(malformed, self.PROMPT))
+
+    def test_queued_guidance_waits_then_naturally_returns_final_body(self):
+        from dataclasses import replace
+        rig = Rig()
+        origin = rig.origin()
+        rig.states[origin.pane_id] = replace(rig.states[origin.pane_id], status="working")
+        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY, status="working")
+        watch = rig.arm(origin, self.PROMPT)
+        self.assertIsNotNone(watch)
+
+        rig.screens[origin.pane_id] = devin_queued_screen(
+            DEVIN_HISTORY, self.PROMPT, "3 subagents · ↓ select"
+        )
+        self.assertTrue(rig.tick())
+        self.assertEqual(rig.messages, [])
+        self.assertEqual(watch.phase, "watching")
+
+        rig.states[origin.pane_id] = replace(rig.states[origin.pane_id], status="done")
+        rig.screens[origin.pane_id] = devin_screen(
+            DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " P1_LIVE_OK"]
+        )
+        rig.tick(2.0)
+        self.assertEqual(rig.messages, [])
+        rig.tick(2.0)
+        self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\nP1_LIVE_OK")])
+        self.assertEqual((watch.phase, watch.reason), ("consumed", "sent"))
 
     def test_guidance_sent_while_working_arms_and_sends_final_body(self):
         # Issue #16: a prompt submitted while the bound pane is working still
