@@ -25,6 +25,7 @@ from .core import BridgeCore
 from .feishu import Credentials, FeishuBridge, LarkTransport
 from .herdr import HerdrAdapter, ManagedRunner, decode_protocol22, safe_identifier, session_command
 from .store import Store
+from .output import connect_output
 
 
 class AlreadyRunning(RuntimeError):
@@ -63,12 +64,21 @@ class InstanceLock:
 class BridgeRuntime:
     """Admission gate and lifetime tracking around the existing Feishu bridge."""
 
-    def __init__(self, core: BridgeCore, bot_open_id: str, send, runner: ManagedRunner) -> None:
+    def __init__(self, core: BridgeCore, bot_open_id: str, send, runner: ManagedRunner,
+                 *, output_reader=None, send_output=None) -> None:
         self.stopping = False
         self.runner = runner
         self._guard = threading.Lock()
         self._workers: set[threading.Thread] = set()
         self.bridge = FeishuBridge(core, bot_open_id, send, thread_factory=self._worker)
+        self.output = (connect_output(core, output_reader, send_output, stopping=lambda: self.stopping)
+                       if output_reader is not None and send_output is not None else None)
+        self._output_thread: threading.Thread | None = None
+
+    def start_output(self) -> None:
+        if self.output is not None and self._output_thread is None and not self.stopping:
+            self._output_thread = threading.Thread(target=self.output.run, name="pane-output", daemon=True)
+            self._output_thread.start()
 
     def _worker(self, *, target, args, daemon):
         def execute():
@@ -92,6 +102,8 @@ class BridgeRuntime:
 
     def close(self) -> None:
         self.stopping = True
+        if self.output is not None:
+            self.output.request_stop()
         reaped = self.runner.stop()
         deadline = time.monotonic() + 3.0
         with self._guard:
@@ -99,8 +111,13 @@ class BridgeRuntime:
         for worker in workers:
             if worker.ident is not None:
                 worker.join(max(0.0, deadline - time.monotonic()))
-        if not reaped or any(worker.is_alive() for worker in workers):
+        if self._output_thread is not None and self._output_thread.ident is not None:
+            self._output_thread.join(max(0.0, deadline - time.monotonic()))
+        if (not reaped or any(worker.is_alive() for worker in workers)
+                or (self._output_thread is not None and self._output_thread.is_alive())):
             raise RuntimeError("Shutdown did not complete within the local grace period")
+        if self.output is not None:
+            self.output.stop()  # Workers are quiescent; clear all remaining captures without sending.
 
 
 @contextmanager
@@ -202,10 +219,16 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None)
                                   management_chat_id=config.management_chat_id, admin_users=config.admin_users,
                                   bot_open_id=config.bot_open_id,
                                   create_group=transport.create_group if config.management_chat_id is not None else None)
-                runtime = BridgeRuntime(core, config.bot_open_id, transport.send, runner)
+                reader = HerdrAdapter(config.session, command_builder=session_command(config.executable),
+                                      decoder=decode_protocol22, runner=runner,
+                                      query_timeout=min(config.query_timeout, 2.0),
+                                      write_timeout=config.write_timeout)
+                runtime = BridgeRuntime(core, config.bot_open_id, transport.send, runner,
+                                        output_reader=reader, send_output=transport.send_output_once)
                 transport.is_stopping = lambda: runtime.stopping
                 with shutdown_signals(runtime):
                     try:
+                        runtime.start_output()
                         logging.getLogger(__name__).warning("HerdR contract=static-not-live; live validation pending")
                         transport.start(runtime)
                     finally:

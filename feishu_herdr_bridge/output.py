@@ -1,15 +1,15 @@
 """O1: passive, bounded extraction and a manually driven observation kernel.
 
-No SDK, database, CLI process, thread, timer, prompt, or file I/O is started here.
+Import starts no SDK, database, CLI, thread, timer, prompt, or file I/O.
 The only screen grammar currently backed by supplied samples is the deliberately
 labelled synthetic/not-live grammar in pane_output.json. Real Codex/Claude/Devin
 layouts are NOT asserted to match it; all other layouts fail closed. A reviewed
 live boundary matcher needs local samples, not broader regexes or Agent prompts.
 
 capture/arm/cancel are called under the existing foreground operation lock;
-tick takes that same lock nonblockingly. O2 must inject authoritative binding /
-authorization and request-phase checks, bounded get/read, and a single-send
-transport. O1 never installs these callbacks into the running bridge.
+tick takes that same lock nonblockingly. connect_output supplies authoritative
+binding/authorization and request-phase checks. Runtime owns one observation
+thread; get/read and send remain injected, bounded, single-operation boundaries.
 """
 
 from __future__ import annotations
@@ -225,7 +225,7 @@ class OutputObserver:
     user/chat authorization and bot identity. invalidate must condition its write
     on that same old snapshot. get/read accept only the frozen Pane ID. They must
     already have <=2s timeouts; send must be a bounded <=3s single-send operation.
-    The O1 fake drives tick explicitly; O2 owns actual timers and concurrency.
+    Tests can drive tick explicitly; runtime may run the interruptible loop.
     """
 
     def __init__(self, *, current: Callable[[Origin], bool],
@@ -233,17 +233,26 @@ class OutputObserver:
                  read: Callable[[str], str], send: Callable[[Origin, str], str],
                  invalidate: Callable[[Origin], None], operation_lock=None,
                  clock: Callable[[], float] = time.monotonic,
-                 audit: Callable[[str, int, str, str], None] | None = None) -> None:
+                 audit: Callable[[str, int, str, str], None] | None = None,
+                 stopping: Callable[[], bool] = lambda: False) -> None:
         self._current, self._request_phase = current, request_phase
         self._get, self._read, self._send, self._invalidate = get, read, send, invalidate
         self._lock = operation_lock if operation_lock is not None else threading.Lock()
         self._clock, self._audit = clock, audit
         self._active: dict[str, Observation] = {}
         self._stopped = False
+        self._external_stopping = stopping
+        self._wake = threading.Event()
+
+    def _stopping(self) -> bool:
+        try:
+            return self._stopped or bool(self._external_stopping())
+        except Exception:
+            return True
 
     def _allowed(self, origin: Origin, phase: str) -> bool:
         try:
-            return (not self._stopped and self._current(origin) is True
+            return (not self._stopping() and self._current(origin) is True
                     and self._request_phase(origin) == phase)
         except Exception:
             return False
@@ -275,6 +284,7 @@ class OutputObserver:
         watch.reason = reason
         watch._baseline, watch._prompt, watch._candidate = None, "", None
         self._emit(watch, "closed", reason)
+        self._wake.set()
 
     def cancel(self, watch: Observation) -> None:
         # A stale completion/cancellation must not remove a newer round.
@@ -287,8 +297,13 @@ class OutputObserver:
         if watch is not None:
             self.cancel(watch)
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        # Safe while a foreground operation owns the lock; do not touch records.
         self._stopped = True
+        self._wake.set()
+
+    def stop(self) -> None:
+        self.request_stop()
         for watch in tuple(self._active.values()):
             self._close(watch, "stopped")
 
@@ -329,6 +344,7 @@ class OutputObserver:
             return False
         watch.phase, watch.next_due, watch.deadline = "watching", now, now + LIFETIME
         self._emit(watch, "armed", "submitted")
+        self._wake.set()
         return True
 
     def _guard(self, watch: Observation) -> bool:
@@ -366,7 +382,7 @@ class OutputObserver:
 
     def tick(self) -> bool:
         """At most one due round; no sleeps, pending work queue, or prompt calls."""
-        if self._stopped or not self._lock.acquire(blocking=False):
+        if self._stopping() or not self._lock.acquire(blocking=False):
             return False
         try:
             now = self._clock()
@@ -428,3 +444,73 @@ class OutputObserver:
             return True
         finally:
             self._lock.release()
+
+
+    def run(self) -> None:
+        """One runtime-owned thread; idle means an interruptible wait, not polling."""
+        try:
+            while not self._stopping():
+                self._wake.clear()
+                if self.tick():
+                    continue
+                delay = 0.1  # Foreground lock contention: yield without a work queue.
+                if self._lock.acquire(blocking=False):
+                    try:
+                        due = [min(w.next_due, w.deadline) for w in self._active.values()
+                               if w.phase == "watching"]
+                        delay = max(0.01, min(due) - self._clock()) if due else None
+                    finally:
+                        self._lock.release()
+                if not self._stopping():
+                    self._wake.wait(delay)
+        except Exception:
+            self.request_stop()  # Never log raw exceptions or replay a failed tick.
+        finally:
+            if self._lock.acquire(blocking=False):
+                try:
+                    self.stop()
+                finally:
+                    self._lock.release()
+
+
+def connect_output(core, reader, send, *, clock=time.monotonic, stopping=lambda: False):
+    """Wire only existing read APIs and SQLite lookups; no scan, schema or writes."""
+    import logging
+    from .core import Message
+
+    def binding_matches(origin, binding):
+        return (binding is not None and binding.valid
+                and (binding.herdr_session, binding.workspace_id, binding.pane_id, binding.revision)
+                == (origin.session, origin.workspace_id, origin.pane_id, origin.revision))
+
+    def current(origin):
+        message = Message(origin.message_id, origin.chat_id, origin.user_id, "", None, origin.chat_type)
+        return (not stopping() and origin.session == reader.session == core.herdr.session == "kpi-agg"
+                and core.bot_open_id == origin.bot_id and core.is_authorized(message)
+                and binding_matches(origin, core.store.get_binding(origin.chat_id)))
+
+    def request_phase(origin):
+        row = core.store.get_request(origin.message_id)
+        if (row is None or (row.chat_id, row.user_id, row.action, row.herdr_session,
+                            row.workspace_id, row.pane_id, row.binding_revision)
+                != (origin.chat_id, origin.user_id, "prompt", origin.session,
+                    origin.workspace_id, origin.pane_id, origin.revision)):
+            return "other"
+        if row.status == "done" and row.result_code == "submitted":
+            return "submitted"
+        return "processing" if row.status == "processing" and row.result_code == "" else "other"
+
+    def invalidate(origin):
+        binding = core.store.get_binding(origin.chat_id)
+        if binding_matches(origin, binding):
+            core.store.invalidate(binding)  # Existing conditional UPDATE protects newer revisions.
+
+    def audit(ref, revision, event, reason):
+        logging.getLogger(__name__).info("output watch=%s revision=%s event=%s reason=%s",
+                                        ref, revision, event, reason)
+
+    observer = OutputObserver(current=current, request_phase=request_phase, get=reader.get_agent,
+                              read=reader.read_agent, send=send, invalidate=invalidate,
+                              operation_lock=core._lock, clock=clock, audit=audit, stopping=stopping)
+    core.output = observer
+    return observer

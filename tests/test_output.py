@@ -791,3 +791,500 @@ class ObserverTests(unittest.TestCase):
         r.tick()
         r.tick(2)
         self.assertEqual([o for o, _ in r.messages], [p2])
+
+
+class CoreRig:
+    """Real core/store/event entry, synthetic Pane, no SDK or subprocess."""
+
+    def __init__(self, directory):
+        import subprocess
+        import threading
+        from feishu_herdr_bridge.core import BridgeCore
+        from feishu_herdr_bridge.feishu import FeishuBridge
+        from feishu_herdr_bridge.herdr import HerdrAdapter, decode_protocol22, session_command
+        from feishu_herdr_bridge.store import Store
+
+        self.now = 0.0
+        self.store = Store(Path(directory) / "output.sqlite3")
+        self.calls, self.prompts, self.sent, self.receipts = [], [], [], []
+        self.screens = {"pane-a": screen("devin", FIXTURE["history"]),
+                        "pane-b": screen("devin", FIXTURE["history"])}
+        self.status = "idle"
+        self.before_call = None
+        self.before_send = None
+        self.serial = 0
+
+        def run(command, timeout):
+            args = list(command[3:])
+            assert command[:3] == ("/offline/herdr", "--session", "kpi-agg")
+            self.calls.append((args, timeout))
+            if self.before_call:
+                self.before_call(args)
+            if args[:2] == ["agent", "get"]:
+                pane = args[2]
+                result = {"type": "agent_info", "agent": {
+                    "workspace_id": "workspace-" + pane[-1], "pane_id": pane,
+                    "tab_id": "tab-" + pane[-1], "terminal_id": "terminal-" + pane[-1],
+                    "agent_status": self.status, "focused": False, "revision": 1,
+                    "name": "fixture-lead", "agent": "devin"}}
+            elif args[:2] == ["agent", "read"]:
+                assert args[3:] == ["--source", "visible", "--lines", "80", "--format", "text"]
+                return subprocess.CompletedProcess(command, 0, self.screens[args[2]], "")
+            elif args[:2] == ["agent", "prompt"]:
+                self.prompts.append((args[2], args[3]))
+                result = {"type": "agent_prompted"}
+            else:
+                raise AssertionError("Unexpected CLI action")
+            return subprocess.CompletedProcess(command, 0, json.dumps({"id": "fixture", "result": result}), "")
+
+        self.herdr = HerdrAdapter("kpi-agg", command_builder=session_command("/offline/herdr"),
+                                  decoder=decode_protocol22, runner=run, query_timeout=2)
+        self.core = BridgeCore(self.store, self.herdr, allowed_chats={"chat-a", "chat-b"},
+                               allowed_users={"user"}, bot_open_id="bot", clock=lambda: 100.0,
+                               operation_lock=threading.Lock())
+        for suffix in ("a", "b"):
+            self.store.bind(chat_id="chat-" + suffix, session="kpi-agg", workspace_id="workspace-" + suffix,
+                            pane_id="pane-" + suffix, agent_name="fixture-lead", user_id="user",
+                            now=100.0, expected_revision=None)
+        self.observer = out.OutputObserver(current=self.current, request_phase=self.request_phase,
+                                          get=self.herdr.get_agent, read=self.herdr.read_agent,
+                                          send=self.deliver, invalidate=self.invalidate,
+                                          operation_lock=self.core._lock, clock=lambda: self.now)
+        # Baseline core permits assignment but does not yet invoke these hooks.
+        self.core.output = self.observer
+        self.bridge = FeishuBridge(self.core, "bot", lambda m, r: self.receipts.append((m, r)))
+
+    def current(self, origin):
+        from feishu_herdr_bridge.core import Message
+        binding = self.store.get_binding(origin.chat_id)
+        return (binding is not None and binding.valid and self.core.bot_open_id == origin.bot_id
+                and (binding.herdr_session, binding.workspace_id, binding.pane_id, binding.revision)
+                == (origin.session, origin.workspace_id, origin.pane_id, origin.revision)
+                and self.core.is_authorized(Message(origin.message_id, origin.chat_id, origin.user_id,
+                                                    "", None, origin.chat_type)))
+
+    def request_phase(self, origin):
+        row = self.store.get_request(origin.message_id)
+        if row is None or row.action != "prompt":
+            return "other"
+        if row.status == "done" and row.result_code == "submitted":
+            return "submitted"
+        return row.status
+
+    def invalidate(self, origin):
+        binding = self.store.get_binding(origin.chat_id)
+        if binding is not None and self.current(origin):
+            self.store.invalidate(binding)
+
+    def deliver(self, origin, body):
+        self.sent.append((origin, body))
+        return self.before_send(origin, body) if self.before_send else "sent"
+
+    def send(self, text, *, chat="chat-a", message_id=None, user="user", stamp="101000"):
+        self.serial += 1
+        data = {"header": {"event_type": "im.message.receive_v1"}, "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": user}},
+            "message": {"message_id": message_id or f"source-{self.serial}", "chat_id": chat,
+                        "chat_type": "group", "message_type": "text", "create_time": stamp,
+                        "content": json.dumps({"text": "@_user_1 " + text}),
+                        "mentions": [{"key": "@_user_1", "id": {"open_id": "bot"}}]}}}
+        worker = self.bridge.receive(data)
+        if worker is not None:
+            worker.join(5)
+            assert not worker.is_alive(), "fake worker did not finish"
+        return self.receipts[-1][1] if self.receipts else None
+
+    def answer(self, turn=0, pane="pane-a", history=None):
+        value = FIXTURE["rounds"][turn]
+        history = FIXTURE["history"] if history is None else history
+        self.screens[pane] = screen("devin", history + [value["user"], value["assistant"]])
+
+    def tick(self, advance=0.0):
+        self.now += advance
+        return self.observer.tick()
+
+
+class CoreOutputIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from unittest.mock import patch
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.rig = CoreRig(self.temp.name)
+        for target in ("socket.socket.connect", "socket.socket.connect_ex", "socket.getaddrinfo", "subprocess.Popen"):
+            guard = patch(target, side_effect=AssertionError("Unexpected real I/O"))
+            blocked = guard.start()
+            self.addCleanup(guard.stop)
+            self.addCleanup(blocked.assert_not_called)
+
+    def test_successful_prompt_produces_one_automatic_message(self):
+        r = self.rig
+        first = FIXTURE["rounds"][0]
+        self.assertEqual(r.send(first["prompt"]).code, "submitted")
+        self.assertEqual(r.prompts, [("pane-a", first["prompt"])])
+        r.answer()
+        r.tick()
+        r.tick(2)
+        self.assertEqual(len(r.sent), 1)
+        self.assertEqual(r.sent[0][1], "主控 Pane pane-a\n" + first["expected"])
+
+    def connect(self):
+        r = self.rig
+        r.observer = out.connect_output(r.core, r.herdr, r.deliver, clock=lambda: r.now)
+        return r
+
+    def test_two_source_prompts_take_new_baselines_and_send_two_bodies(self):
+        r = self.connect()
+        first, second = FIXTURE["rounds"]
+        original = r.store.get_binding("chat-a")
+        self.assertEqual(r.send(first["prompt"], message_id="p1").code, "submitted")
+        r.answer()
+        r.tick()
+        r.tick(2)
+        before = len(r.calls)
+        self.assertEqual(r.send(first["prompt"], message_id="p1").code, "duplicate")
+        self.assertEqual(len(r.calls), before)
+        self.assertEqual(r.send(second["prompt"], message_id="p2").code, "submitted")
+        r.answer(1, history=FIXTURE["history"] + [first["user"], first["assistant"]])
+        r.tick()
+        self.assertEqual(len(r.sent), 1)
+        r.tick(2)
+        self.assertEqual([body for _, body in r.sent], ["主控 Pane pane-a\n" + first["expected"],
+                                                      "主控 Pane pane-a\n" + second["expected"]])
+        self.assertEqual([origin.message_id for origin, _ in r.sent], ["p1", "p2"])
+        self.assertEqual(r.prompts, [("pane-a", first["prompt"]), ("pane-a", second["prompt"])])
+        self.assertEqual(r.store.get_binding("chat-a"), original)
+        self.assertEqual(r.send(second["prompt"], message_id="p2").code, "duplicate")
+        r.tick(200)
+        self.assertEqual(len(r.sent), 2)
+
+    def test_rejected_or_nonprompt_events_do_not_capture(self):
+        r = self.connect()
+        r.send("stale", stamp="99000")
+        r.send("--unsafe")
+        r.send("forbidden", user="outsider")
+        r.send("/clear")
+        with r.core._lock:
+            self.assertEqual(r.send("busy").code, "busy")
+        self.assertEqual(r.prompts, [])
+        self.assertEqual(r.observer._active, {})
+        self.assertEqual(r.calls, [])
+        self.assertEqual(r.send("/bind").code, "binding")
+        self.assertEqual(r.observer._active, {})
+        self.assertTrue(all(args[:2] == ["agent", "get"] for args, _ in r.calls))
+
+    def test_capture_failure_does_not_fail_or_repeat_prompt(self):
+        r = self.connect()
+        def broken_read(args):
+            if args[:2] == ["agent", "read"]:
+                raise TimeoutError("PRIVATE baseline")
+        r.before_call = broken_read
+        reply = r.send(FIXTURE["rounds"][0]["prompt"])
+        self.assertEqual(reply.code, "submitted")
+        self.assertNotIn("PRIVATE", reply.text)
+        self.assertEqual(len(r.prompts), 1)
+        self.assertTrue(r.store.get_binding("chat-a").valid)
+        self.assertEqual(r.observer._active, {})
+
+    def test_uncertain_prompt_or_failed_bookkeeping_never_arm(self):
+        from unittest.mock import patch
+        r = self.connect()
+        def uncertain(args):
+            if args[:2] == ["agent", "prompt"]:
+                raise TimeoutError("PRIVATE prompt")
+        r.before_call = uncertain
+        self.assertEqual(r.send("task", message_id="unknown").status, "unknown")
+        self.assertEqual(r.observer._active, {})
+        self.assertEqual(r.send("task", message_id="unknown").code, "duplicate")
+        r.before_call = None
+        self.assertEqual(r.send("/bind workspace-a pane-a").code, "bound")
+        with patch.object(r.store, "finish", side_effect=RuntimeError("PRIVATE storage")):
+            self.assertEqual(r.send("task2", message_id="record-failed").status, "unknown")
+        self.assertEqual(r.observer._active, {})
+        r.tick(5)
+        self.assertEqual(r.sent, [])
+        self.assertEqual(r.store.get_request("record-failed").status, "processing")
+
+    def test_arm_error_preserves_submission_and_discards_candidate(self):
+        from unittest.mock import patch
+        r = self.connect()
+        arm = r.observer.arm
+        def failed(watch):
+            arm(watch)
+            raise RuntimeError("PRIVATE hook")
+        with patch.object(r.observer, "arm", side_effect=failed):
+            reply = r.send(FIXTURE["rounds"][0]["prompt"])
+        self.assertEqual((reply.status, reply.code), ("done", "submitted"))
+        self.assertEqual(r.observer._active, {})
+        self.assertEqual(len(r.prompts), 1)
+        self.assertTrue(r.store.get_binding("chat-a").valid)
+
+    def test_working_next_prompt_and_manual_read_cancel_only_their_chat(self):
+        r = self.connect()
+        first = FIXTURE["rounds"][0]
+        r.send(first["prompt"])
+        r.send(first["prompt"], chat="chat-b")
+        r.status = "working"
+        self.assertEqual(r.send("next task").code, "submitted")
+        self.assertNotIn("chat-a", r.observer._active)
+        self.assertIn("chat-b", r.observer._active)
+        r.status = "idle"
+        self.assertEqual(r.send("/read", chat="chat-b").code, "read")
+        self.assertEqual(r.observer._active, {})
+        r.answer()
+        r.tick(5)
+        self.assertEqual(r.sent, [])
+
+    def test_two_chats_poll_only_frozen_targets(self):
+        r = self.connect()
+        first, second = FIXTURE["rounds"]
+        r.send(first["prompt"], message_id="a")
+        r.send(second["prompt"], chat="chat-b", message_id="b")
+        r.answer()
+        r.answer(1, pane="pane-b")
+        for advance in (0, 0, 2, 0):
+            r.tick(advance)
+        self.assertEqual({(o.chat_id, o.pane_id, body) for o, body in r.sent}, {
+            ("chat-a", "pane-a", "主控 Pane pane-a\n" + first["expected"]),
+            ("chat-b", "pane-b", "主控 Pane pane-b\n" + second["expected"])})
+        self.assertTrue(all(args[0] == "agent" and args[1] in {"get", "read", "prompt"}
+                            and args[2] in {"pane-a", "pane-b"} for args, _ in r.calls))
+
+    def test_rebind_during_capture_does_not_submit_to_old_pane(self):
+        r = self.connect()
+        def rebind(args):
+            if args[:2] == ["agent", "read"]:
+                old = r.store.get_binding("chat-a")
+                r.store.bind(chat_id="chat-a", session="kpi-agg", workspace_id="workspace-a",
+                             pane_id="pane-a", agent_name="fixture", user_id="user", now=101,
+                             expected_revision=old.revision)
+        r.before_call = rebind
+        self.assertEqual(r.send("new task").code, "binding_changed")
+        self.assertEqual(r.prompts, [])
+        self.assertEqual(r.observer._active, {})
+        self.assertTrue(r.store.get_binding("chat-a").valid)
+
+    def test_rebinding_before_during_and_after_read_drops_old_output(self):
+        for point in ("before", "read", "attempted"):
+            with self.subTest(point=point):
+                r = self.connect()
+                r.before_call = None
+                r.screens["pane-a"] = screen("devin", FIXTURE["history"])
+                r.send(FIXTURE["rounds"][0]["prompt"])
+                r.answer()
+                def rebind(*_):
+                    old = r.store.get_binding("chat-a")
+                    r.store.bind(chat_id="chat-a", session="kpi-agg", workspace_id="workspace-a",
+                                 pane_id="pane-a", agent_name="fixture", user_id="user", now=100,
+                                 expected_revision=old.revision)
+                if point == "before":
+                    rebind()
+                elif point == "read":
+                    r.before_call = lambda args: rebind() if args[:2] == ["agent", "read"] else None
+                else:
+                    r.tick()
+                    r.observer._audit = lambda ref, rev, event, reason: rebind() if event == "attempted" else None
+                r.tick(2)
+                self.assertEqual(r.sent, [])
+                self.assertEqual(r.observer._active, {})
+                self.assertTrue(r.store.get_binding("chat-a").valid)
+
+    def test_request_ledger_full_frozen_tuple_and_authorization_are_rechecked(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        r = self.connect()
+        for field, value in (("chat_id", "chat-b"), ("user_id", "other"), ("action", "read"),
+                             ("herdr_session", "other"), ("workspace_id", "other"),
+                             ("pane_id", "pane-b"), ("binding_revision", 99), ("result_code", "wrong")):
+            with self.subTest(field=field):
+                self.assertEqual(r.send("task").code, "submitted")
+                record = r.store.get_request("source-" + str(r.serial))
+                before = len(r.calls)
+                with patch.object(r.store, "get_request", return_value=replace(record, **{field: value})):
+                    r.tick()
+                self.assertEqual(len(r.calls), before)
+                self.assertEqual(r.observer._active, {})
+        for change in ("user", "bot"):
+            r.send("task")
+            before = len(r.calls)
+            if change == "user":
+                r.core.allowed_users = frozenset()
+            else:
+                r.core.bot_open_id = "other-bot"
+            r.tick()
+            self.assertEqual(len(r.calls), before)
+            self.assertEqual(r.sent, [])
+            r.core.allowed_users = frozenset({"user"})
+            r.core.bot_open_id = "bot"
+
+    def test_read_failure_invalidates_only_original_binding_and_does_not_retry(self):
+        r = self.connect()
+        r.send("task", message_id="read-failure")
+        def fail(args):
+            if args[:2] == ["agent", "read"]:
+                raise TimeoutError("PRIVATE")
+        r.before_call = fail
+        r.tick()
+        self.assertFalse(r.store.get_binding("chat-a").valid)
+        self.assertEqual(r.store.get_request("read-failure").status, "done")
+        calls = list(r.calls)
+        r.tick(3)
+        self.assertEqual(r.calls, calls)
+        self.assertEqual(r.sent, [])
+        self.assertEqual(len(r.prompts), 1)
+
+    def test_restart_does_not_replay_and_new_prompt_starts_fresh(self):
+        from feishu_herdr_bridge.core import BridgeCore
+        from feishu_herdr_bridge.feishu import FeishuBridge
+        from feishu_herdr_bridge.store import Store
+        r = self.connect()
+        first, second = FIXTURE["rounds"]
+        r.send(first["prompt"], message_id="before-restart")
+        r.answer()
+        r.tick()  # Candidate exists, but no automatic send yet.
+        r.observer.stop()
+        r.core = BridgeCore(Store(r.store.path), r.herdr, allowed_chats={"chat-a", "chat-b"},
+                            allowed_users={"user"}, bot_open_id="bot", clock=lambda: 100.0)
+        self.connect()
+        r.bridge = FeishuBridge(r.core, "bot", lambda m, reply: r.receipts.append((m, reply)))
+        before = len(r.calls)
+        r.tick(5)
+        self.assertEqual(r.send(first["prompt"], message_id="before-restart").code, "duplicate")
+        self.assertEqual(len(r.calls), before)
+        self.assertEqual(r.sent, [])
+        r.send(second["prompt"], message_id="after-restart")
+        r.answer(1, history=FIXTURE["history"] + [first["user"], first["assistant"]])
+        r.tick()
+        r.tick(2)
+        self.assertEqual([body for _, body in r.sent], ["主控 Pane pane-a\n" + second["expected"]])
+
+    def test_send_failure_never_fails_original_prompt_or_releases_binding(self):
+        r = self.connect()
+        r.send(FIXTURE["rounds"][0]["prompt"], message_id="once")
+        r.answer()
+        def lost(*_):
+            raise RuntimeError("PRIVATE RECEIPT")
+        r.before_send = lost
+        r.tick()
+        r.tick(2)
+        self.assertEqual(len(r.sent), 1)
+        self.assertEqual(r.store.get_request("once").status, "done")
+        self.assertTrue(r.store.get_binding("chat-a").valid)
+        self.assertEqual(r.send("duplicate", message_id="once").code, "duplicate")
+        r.tick(200)
+        self.assertEqual((len(r.prompts), len(r.sent)), (1, 1))
+
+    def test_send_and_bridge_rebind_are_serialized_by_original_lock(self):
+        import threading
+        r = self.connect()
+        first = FIXTURE["rounds"][0]
+        r.send(first["prompt"])
+        r.answer()
+        r.tick()
+        entered, release = threading.Event(), threading.Event()
+        results = []
+        def held_send(origin, body):
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("fake sender")
+            results.append(origin)
+            return "unknown"
+        r.before_send = held_send
+        worker = threading.Thread(target=lambda: r.tick(2))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            binding = r.store.get_binding("chat-a")
+            self.assertEqual(r.send("/bind workspace-a pane-a").code, "busy")
+            self.assertEqual(r.store.get_binding("chat-a"), binding)
+        finally:
+            release.set()
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results[0].revision, binding.revision)
+        self.assertEqual(results[0].chat_id, "chat-a")
+        self.assertEqual(r.send("/bind workspace-a pane-a").code, "bound")
+        r.tick(5)
+        self.assertEqual(len(r.sent), 1)
+
+    def test_database_and_audit_contain_no_prompt_or_output_content(self):
+        import sqlite3
+        from contextlib import closing
+        r = self.connect()
+        first = FIXTURE["rounds"][0]
+        with self.assertLogs("feishu_herdr_bridge.output", level="INFO") as logs:
+            r.send(first["prompt"], message_id="PRIVATE-SOURCE-ID")
+            r.answer()
+            r.tick()
+            r.tick(2)
+        with closing(sqlite3.connect(r.store.path)) as db:
+            dump = "\n".join(db.iterdump())
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(tables, {"bindings", "requests", "create_requests", "group_requests"})
+        for private in (first["prompt"], first["expected"]):
+            self.assertNotIn(private, dump)
+            self.assertNotIn(private, "\n".join(logs.output))
+        for private in ("PRIVATE-SOURCE-ID", "chat-a", "pane-a"):
+            self.assertNotIn(private, "\n".join(logs.output))
+
+    def test_done_dynamic_group_revocation_is_seen_without_restarting_observer(self):
+        from contextlib import closing
+        import sqlite3
+        from feishu_herdr_bridge.store import GroupRequest
+        r = self.connect()
+        group = GroupRequest("fixture-group", "g-" + "a" * 16, "management", "user",
+                             "synthetic", "fixture-uuid", "kpi-agg", "bot", None,
+                             "pending", "", 400.0, 100.0, 100.0)
+        r.store.propose_group(group)
+        r.store.begin_group(group, 101.0)
+        r.store.save_group_resource(group.request_id, "chat-a", 101.0)
+        r.store.complete_group(group.request_id, 101.0)
+        r.core.allowed_chats = frozenset({"chat-b"})
+        self.assertEqual(r.send(FIXTURE["rounds"][0]["prompt"]).code, "submitted")
+        r.answer()
+        r.tick()
+        with closing(sqlite3.connect(r.store.path)) as db, db:
+            db.execute("UPDATE group_requests SET status='unknown' WHERE request_id=?", (group.request_id,))
+        before = len(r.calls)
+        r.tick(2)
+        self.assertEqual(r.sent, [])
+        self.assertEqual(len(r.calls), before)
+        self.assertTrue(r.store.get_binding("chat-a").valid)
+        self.assertEqual(r.observer._active, {})
+
+    def test_workspace_transfer_never_redirects_old_output_to_new_owner(self):
+        r = self.connect()
+        r.send(FIXTURE["rounds"][0]["prompt"])
+        r.answer()
+        r.tick()
+        for chat, workspace, pane in (("chat-a", "workspace-c", "pane-c"),
+                                       ("chat-b", "workspace-a", "pane-a")):
+            binding = r.store.get_binding(chat)
+            with r.core._lock:
+                r.store.bind(chat_id=chat, session="kpi-agg", workspace_id=workspace, pane_id=pane,
+                             agent_name="fixture-lead", user_id="user", now=102.0,
+                             expected_revision=binding.revision)
+        before = len(r.calls)
+        r.tick(2)
+        self.assertEqual(r.sent, [])
+        self.assertEqual(len(r.calls), before)
+        self.assertEqual(r.store.get_binding("chat-b").workspace_id, "workspace-a")
+        self.assertTrue(r.store.get_binding("chat-b").valid)
+
+    def test_broken_cancel_stops_observer_but_new_prompt_keeps_original_semantics(self):
+        from unittest.mock import patch
+        r = self.connect()
+        r.send(FIXTURE["rounds"][0]["prompt"])
+        r.answer()
+        r.tick()
+        with patch.object(r.observer, "cancel_current", side_effect=RuntimeError("PRIVATE")):
+            reply = r.send(FIXTURE["rounds"][1]["prompt"])
+        self.assertEqual(reply.code, "submitted")
+        self.assertNotIn("PRIVATE", reply.text)
+        r.tick(2)
+        self.assertEqual(r.sent, [])
+        self.assertEqual(len(r.prompts), 2)
+        self.assertTrue(r.store.get_binding("chat-a").valid)
+        r.observer.stop()
+        self.assertEqual(r.observer._active, {})

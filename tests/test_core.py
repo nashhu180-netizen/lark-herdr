@@ -405,3 +405,34 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.fake.events(), [])
         with closing(sqlite3.connect(self.store.path)) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM create_requests").fetchone()[0], 0)
+
+    def test_optional_capture_failure_does_not_fail_or_replay_prompt(self):
+        from dataclasses import replace
+        from unittest.mock import Mock
+        from feishu_herdr_bridge.output import OutputObserver
+
+        self.bind()
+        self.core.bot_open_id = "fixture-bot"
+        self.core.output = Mock(spec=OutputObserver)
+        self.core.output.capture.side_effect = RuntimeError("PRIVATE hook error")
+        message = replace(self.message("normal task"), chat_type="group")
+        reply = self.core.handle(message)
+        self.assertEqual((reply.status, reply.code), ("done", "submitted"))
+        self.assertNotIn("PRIVATE", reply.text)
+        self.assertEqual(self.core.handle(message).code, "duplicate")
+        self.assertEqual(len(self.fake.events("submitted")), 1)
+        self.assertTrue(self.store.get_binding("chat-a").valid)
+        self.core.output.arm.assert_not_called()
+
+    def test_manual_read_cancels_observation_without_changing_cancel_command(self):
+        from unittest.mock import Mock
+        from feishu_herdr_bridge.output import OutputObserver
+
+        self.bind()
+        self.core.output = Mock(spec=OutputObserver)
+        self.assertEqual(self.send("/cancel").code, "nothing_to_cancel")
+        self.core.output.cancel_current.assert_not_called()
+        reply = self.send("/read")
+        self.assertEqual(reply.code, "read")
+        self.assertIn("screen-A", reply.text)
+        self.core.output.cancel_current.assert_called_once_with("chat-a")
