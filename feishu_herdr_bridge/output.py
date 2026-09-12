@@ -80,6 +80,10 @@ _DEVIN_QUEUE_INPUT = "❭ Press Enter to send queued messages now"
 _DEVIN_TOOL_HEAD = re.compile(r" [○◐◔◑◕⏺] ")
 _DEVIN_USER_CONT = re.compile(r"  \S")
 _DEVIN_TOOL_BODY = ("│", " │", " └")
+_DEVIN_DID_YOU_KNOW_TIP = (
+    " ✱ Did you know",
+    "   Use /bug to report a bug to the Devin CLI developers",
+)
 
 
 def _devin_frame(lines: list[str]) -> _Frame | None:
@@ -114,6 +118,10 @@ def _devin_frame(lines: list[str]) -> _Frame | None:
 
     while transcript and blank(transcript[-1]):
         transcript.pop()  # Pre-chrome blank rows are spacing, not transcript.
+    if tuple(transcript[-2:]) == _DEVIN_DID_YOU_KNOW_TIP:
+        del transcript[-2:]
+        while transcript and blank(transcript[-1]):
+            transcript.pop()
     blocks: list[_Block] = []
     i, n = 0, len(transcript)
 

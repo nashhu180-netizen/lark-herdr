@@ -196,6 +196,25 @@ class RealDevinExtractionTests(unittest.TestCase):
         after = self.round(" P1_LIVE_OK")
         self.assertEqual(out.extract_new_text("devin", before, after, self.PROMPT).body, "P1_LIVE_OK")
 
+    def test_exact_did_you_know_tip_after_answer_is_not_returned(self):
+        before = devin_screen(DEVIN_HISTORY)
+        after = self.round(
+            " P1_LIVE_OK", "", " ✱ Did you know",
+            "   Use /bug to report a bug to the Devin CLI developers",
+        )
+        self.assertEqual(
+            out.extract_new_text("devin", before, after, self.PROMPT).body,
+            "P1_LIVE_OK",
+        )
+        near_match = self.round(
+            " P1_LIVE_OK", "", " ✱ Did you know",
+            "   Arbitrary assistant text must remain visible",
+        )
+        self.assertIn(
+            "Arbitrary assistant text must remain visible",
+            out.extract_new_text("devin", before, near_match, self.PROMPT).body,
+        )
+
     def test_tool_lines_and_blank_separators_are_not_body(self):
         before = devin_screen(DEVIN_HISTORY)
         after = self.round(" part one", "", " ⏺ Ran command", " │ $ cmd", " │ out", " └ Exited with code 0",
