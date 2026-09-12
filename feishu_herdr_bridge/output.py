@@ -71,6 +71,10 @@ _DEVIN_RULE = re.compile(r"─+")
 _DEVIN_RULE_TOP = re.compile(r"─+( \([^()]*\) ─+)?")
 _DEVIN_SPINNER = re.compile(r"\(esc (?:(?:twice|again) )?to interrupt[^()]*\)"
                             r"(?:\s[^()]*\([^()]*\))?(\s[^()]*)?$")
+_DEVIN_ACTIVITY = re.compile(
+    r"(?:(?:[1-9][0-9]* subagents?)(?: · [1-9][0-9]* shells?)?"
+    r"|[1-9][0-9]* shells?) · ↓ select"
+)
 _DEVIN_TOOL_HEAD = re.compile(r" [○◐◔◑◕⏺] ")
 _DEVIN_USER_CONT = re.compile(r"  \S")
 _DEVIN_TOOL_BODY = ("│", " │", " └")
@@ -82,15 +86,18 @@ def _devin_frame(lines: list[str]) -> _Frame | None:
     Chrome: transcript rows, optional working spinner, a rule, one '❭ ' input
     line, a rule, then the model/context status bar as the last row.
     """
-    if (len(lines) < 5 or _DEVIN_STATUS.fullmatch(lines[-1]) is None
-            or _DEVIN_RULE.fullmatch(lines[-2]) is None
-            or not lines[-3].startswith("❭")
-            or _DEVIN_RULE_TOP.fullmatch(lines[-4]) is None):
+    chrome_end = len(lines)
+    if lines and _DEVIN_ACTIVITY.fullmatch(lines[-1]) is not None:
+        chrome_end -= 1
+    if (chrome_end < 5 or _DEVIN_STATUS.fullmatch(lines[chrome_end - 1]) is None
+            or _DEVIN_RULE.fullmatch(lines[chrome_end - 2]) is None
+            or not lines[chrome_end - 3].startswith("❭")
+            or _DEVIN_RULE_TOP.fullmatch(lines[chrome_end - 4]) is None):
         return None
-    end, status = len(lines) - 4, "idle"
+    end, status = chrome_end - 4, "idle"
     if end > 0 and _DEVIN_SPINNER.search(lines[end - 1]):
         status, end = "working", end - 1
-    if lines[-3] == "❭ Guide Devin while it works":
+    if lines[chrome_end - 3] == "❭ Guide Devin while it works":
         status = "working"  # Working placeholder; same signal the agent detector uses.
     transcript = lines[:end]
 

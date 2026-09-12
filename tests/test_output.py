@@ -38,12 +38,15 @@ DEVIN_HISTORY = [
 ]
 
 
-def devin_screen(transcript, status="idle", input_text=None, spinner=DEVIN_SPINNER):
+def devin_screen(transcript, status="idle", input_text=None, spinner=DEVIN_SPINNER,
+                 activity=None):
     lines = list(transcript) + [""]
     if status == "working":
         lines.append(spinner)
     lines.extend([DEVIN_RULE_TOP, "❭ " + (input_text if input_text is not None else DEVIN_IDLE_INPUT[2:]),
                   DEVIN_RULE_BOTTOM, DEVIN_STATUS])
+    if activity is not None:
+        lines.append(activity)
     return "\n".join(lines) + "\n"
 
 
@@ -390,6 +393,28 @@ class RealDevinExtractionTests(unittest.TestCase):
             with self.subTest(spinner=spinner):
                 after = devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " partial"],
                                      status="working", spinner=spinner)
+                self.assertEqual(out.extract_new_text("devin", before, after, self.PROMPT).reason,
+                                 "unrecognized")
+
+    def test_working_activity_footer_is_not_transcript(self):
+        # Devin adds this chrome row below Context while subagents and shells
+        # are active. It must not be parsed as assistant output.
+        before = devin_screen(DEVIN_HISTORY)
+        for activity in ("3 subagents · 1 shell · ↓ select",
+                         "1 subagent · 2 shells · ↓ select",
+                         "3 subagents · ↓ select", "1 shell · ↓ select"):
+            with self.subTest(activity=activity):
+                after = devin_screen(
+                    DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " partial"],
+                    status="working", activity=activity,
+                )
+                result = out.extract_new_text("devin", before, after, self.PROMPT)
+                self.assertIsNone(result.body)
+                self.assertEqual(result.reason, "not_ready")
+        for activity in ("3 subagents · 1 shell", "subagents · shell · ↓ select",
+                         "3 subagents · 1 shell · select"):
+            with self.subTest(activity=activity):
+                after = devin_screen(DEVIN_HISTORY, status="working", activity=activity)
                 self.assertEqual(out.extract_new_text("devin", before, after, self.PROMPT).reason,
                                  "unrecognized")
 
