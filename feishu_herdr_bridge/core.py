@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Collection, Mapping
 from uuid import uuid4
 
-from .output import Observation, Origin, OutputObserver, queued_devin_prompt
+from .output import Observation, Origin, OutputObserver
 from .herdr import Agent, HerdrAdapter, HerdrError, Workspace, safe_identifier, safe_text, valid_agent_name
 from .store import Binding, BindingChanged, Creation, CreationRejected, GroupRequest, Store, WorkspaceOccupied
 
@@ -374,17 +374,6 @@ class BridgeCore:
         self._capture_output(message, snapshot, agent)
         self._assert_current(snapshot)  # Capture added reads; never bypass a changed binding.
         self.herdr.prompt(snapshot.pane_id, message.text)
-        if agent.kind == "devin" and agent.status == "working":
-            # Devin may stage working-time guidance behind an explicit Enter.
-            # Confirm only one exact queue entry matching this accepted message;
-            # every read/parse/key failure remains auxiliary to the prompt write.
-            try:
-                for _ in range(3):
-                    if queued_devin_prompt(self.herdr.read_agent(snapshot.pane_id), message.text):
-                        self.herdr.send_enter(snapshot.pane_id)
-                        break
-            except Exception:
-                pass
         return Reply("done", "submitted", f"{label}已提交，尚未确认任务完成。")
 
     def _stop_output(self) -> None:

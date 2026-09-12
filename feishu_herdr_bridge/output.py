@@ -157,28 +157,6 @@ def _devin_frame(lines: list[str]) -> _Frame | None:
     return _Frame(tuple("| " + row.rstrip() for row in transcript), tuple(blocks), status, True)
 
 
-def queued_devin_prompt(raw: str, prompt: str) -> bool:
-    """Recognize one exact Devin guidance queue entry before sending Enter."""
-    text, expected = _text(raw), _prompt(prompt)
-    if text is None or expected is None or "\n" in expected:
-        return False
-    lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()
-    chrome_end = len(lines)
-    if lines and _DEVIN_ACTIVITY.fullmatch(lines[-1]) is not None:
-        chrome_end -= 1
-    if (chrome_end < 7 or lines[chrome_end - 3] != _DEVIN_QUEUE_INPUT
-            or _DEVIN_STATUS.fullmatch(lines[chrome_end - 1]) is None
-            or _DEVIN_RULE.fullmatch(lines[chrome_end - 2]) is None
-            or _DEVIN_RULE_TOP.fullmatch(lines[chrome_end - 4]) is None):
-        return False
-    end = chrome_end - 4
-    return (end >= 3 and _DEVIN_SPINNER.search(lines[end - 3]) is not None
-            and _DEVIN_QUEUE_RULE.fullmatch(lines[end - 2]) is not None
-            and lines[end - 1] == "○ " + expected
-            and _devin_frame(lines) is not None)
-
 
 def _text(value: str) -> str | None:
     if not isinstance(value, str):
