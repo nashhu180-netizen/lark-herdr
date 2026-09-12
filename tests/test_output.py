@@ -18,6 +18,35 @@ def screen(kind, blocks, status="idle", input_text=""):
     return "\n".join(lines)
 
 
+# Minimal sanitized model of the real Devin CLI visible-text layout sampled from
+# the authorized disposable pane w1V:p1 (no real transcript content is kept).
+DEVIN_RULE_TOP = "─" * 40 + " (bypass permissions on) ─"
+DEVIN_RULE_BOTTOM = "─" * 46
+DEVIN_STATUS = "SWE-2 Max" + " " * 24 + "Context: 120k / 262k tokens (46%)"
+DEVIN_IDLE_INPUT = "❭ Ask Devin to build features, fix bugs, or work on your code"
+DEVIN_SPINNER = "⠀⠸ Running tools · 0m 3s (esc twice to interrupt)"
+
+DEVIN_HISTORY = [
+    "❭ earlier request",
+    "",
+    " earlier answer text",
+    "",
+    " ⏺ Ran command",
+    " │ $ some command",
+    " │ output line",
+    " └ Exited with code 0",
+]
+
+
+def devin_screen(transcript, status="idle", input_text=None):
+    lines = list(transcript) + [""]
+    if status == "working":
+        lines.append(DEVIN_SPINNER)
+    lines.extend([DEVIN_RULE_TOP, "❭ " + (input_text if input_text is not None else DEVIN_IDLE_INPUT[2:]),
+                  DEVIN_RULE_BOTTOM, DEVIN_STATUS])
+    return "\n".join(lines) + "\n"
+
+
 class ExtractionTests(unittest.TestCase):
     def test_complete_new_user_and_body_extracts_exact_unicode_answer(self):
         first = FIXTURE["rounds"][0]
@@ -138,6 +167,92 @@ class ExtractionTests(unittest.TestCase):
                 self.assertIsNone(out.extract_new_text("devin", before, current, first["prompt"]).body)
         self.assertIsNone(out.extract_new_text("devin", "x" * (out.MAX_BYTES + 1), after, first["prompt"]).body)
         self.assertIsNone(out.extract_new_text("devin", before, after, "中" * 11000).body)
+
+
+class RealDevinExtractionTests(unittest.TestCase):
+    """Behavior tests for the sampled real Devin CLI visible-text layout."""
+
+    PROMPT = "仅回复：P1_LIVE_OK"
+
+    def round(self, *body_lines, prompt=None):
+        echo = ["", "❭ " + (self.PROMPT if prompt is None else prompt)]
+        return devin_screen(DEVIN_HISTORY + echo + ["", *body_lines])
+
+    def test_new_prompt_and_answer_extract_body(self):
+        before = devin_screen(DEVIN_HISTORY)
+        after = self.round(" P1_LIVE_OK")
+        self.assertEqual(out.extract_new_text("devin", before, after, self.PROMPT).body, "P1_LIVE_OK")
+
+    def test_tool_lines_and_blank_separators_are_not_body(self):
+        before = devin_screen(DEVIN_HISTORY)
+        after = self.round(" part one", "", " ⏺ Ran command", " │ $ cmd", " │ out", " └ Exited with code 0",
+                           "", " final answer 第二段")
+        self.assertEqual(out.extract_new_text("devin", before, after, self.PROMPT).body,
+                         "part one\n\nfinal answer 第二段")
+
+    def test_working_chrome_reports_not_ready_not_answer(self):
+        before = devin_screen(DEVIN_HISTORY)
+        after = devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " partial"], status="working")
+        result = out.extract_new_text("devin", before, after, self.PROMPT)
+        self.assertIsNone(result.body)
+        self.assertEqual(result.reason, "not_ready")
+        guide = devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " partial"],
+                             input_text="Guide Devin while it works")
+        self.assertIsNone(out.extract_new_text("devin", before, guide, self.PROMPT).body)
+
+    def test_wrong_echo_second_prompt_and_missing_echo_fail_closed(self):
+        before = devin_screen(DEVIN_HISTORY)
+        self.assertIsNone(out.extract_new_text("devin", before, self.round(" answer", prompt="别的提示"),
+                                               self.PROMPT).body)
+        two_users = devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " answer", "",
+                                                  "❭ foreign prompt", "", " foreign answer"])
+        self.assertIsNone(out.extract_new_text("devin", before, two_users, self.PROMPT).body)
+        no_echo = devin_screen(DEVIN_HISTORY + ["", " orphaned answer text"])
+        self.assertIsNone(out.extract_new_text("devin", before, no_echo, self.PROMPT).body)
+
+    def test_broken_chrome_and_foreign_glyphs_fail_closed(self):
+        before = devin_screen(DEVIN_HISTORY)
+        good = self.round(" P1_LIVE_OK")
+        broken = [good.replace(DEVIN_STATUS, "garbage status"),
+                  good.replace(DEVIN_RULE_BOTTOM, "=== not a rule ==="),
+                  good.replace("❭ " + DEVIN_IDLE_INPUT[2:], "> prompt"),
+                  good.replace(DEVIN_RULE_TOP, "─" * 10 + " (a) ─ (b) ─"),
+                  devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " ok", "◆ unknown card"])]
+        for current in broken:
+            with self.subTest(current=repr(current[:60])):
+                self.assertIsNone(out.extract_new_text("devin", before, current, self.PROMPT).body)
+
+    def test_wrapped_multiline_echo_matches_compact_prompt(self):
+        before = devin_screen(DEVIN_HISTORY)
+        prompt = "第一段 wraps here\n\n第二段落"
+        echo = ["", "❭ 第一段 wraps", "  here", "", "  第二段落", ""]
+        after = devin_screen(DEVIN_HISTORY + echo + [" done"])
+        self.assertEqual(out.extract_new_text("devin", before, after, prompt).body, "done")
+
+    def test_real_layout_is_devin_only_and_scrolled_overlap_still_works(self):
+        before = devin_screen(DEVIN_HISTORY)
+        after = self.round(" P1_LIVE_OK")
+        for kind in ("codex", "claude"):
+            self.assertIsNone(out.extract_new_text(kind, before, after, self.PROMPT).body)
+        scrolled_before = devin_screen(DEVIN_HISTORY)
+        scrolled_after = devin_screen(DEVIN_HISTORY[2:] + ["", "❭ " + self.PROMPT, "", " P1_LIVE_OK", ""])
+        self.assertEqual(out.extract_new_text("devin", scrolled_before, scrolled_after, self.PROMPT).body,
+                         "P1_LIVE_OK")
+
+    def test_observer_sends_real_devin_answer_once(self):
+        from dataclasses import replace
+        rig = Rig()
+        origin = rig.origin()
+        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY)
+        watch = rig.arm(origin, self.PROMPT)
+        self.assertIsNotNone(watch)
+        rig.screens[origin.pane_id] = self.round(" P1_LIVE_OK")
+        self.assertTrue(rig.tick())
+        self.assertEqual(rig.messages, [])
+        rig.states[origin.pane_id] = replace(rig.states[origin.pane_id], status="done")
+        self.assertTrue(rig.tick(2.0))
+        self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\nP1_LIVE_OK")])
+        self.assertEqual((watch.phase, watch.reason), ("consumed", "sent"))
 
 
 class FormatTests(unittest.TestCase):

@@ -1,10 +1,10 @@
 """O1: passive, bounded extraction and a manually driven observation kernel.
 
 Import starts no SDK, database, CLI, thread, timer, prompt, or file I/O.
-The only screen grammar currently backed by supplied samples is the deliberately
-labelled synthetic/not-live grammar in pane_output.json. Real Codex/Claude/Devin
-layouts are NOT asserted to match it; all other layouts fail closed. A reviewed
-live boundary matcher needs local samples, not broader regexes or Agent prompts.
+Two screen grammars are recognized, both fail-closed: the deliberately labelled
+synthetic/not-live grammar in pane_output.json, and - for kind "devin" only - the
+real Devin CLI visible-text layout sampled from the authorized disposable pane
+(transcript rows over a fixed input chrome). All other layouts fail closed.
 
 capture/arm/cancel are called under the existing foreground operation lock;
 tick takes that same lock nonblockingly. connect_output supplies authoritative
@@ -15,6 +15,7 @@ thread; get/read and send remain injected, bounded, single-operation boundaries.
 from __future__ import annotations
 
 import math
+import re
 import secrets
 import threading
 import time
@@ -54,6 +55,83 @@ class _Frame:
     rows: tuple[str, ...]
     blocks: tuple[_Block, ...]
     status: str
+    real: bool = False
+
+
+# Real Devin CLI chrome markers (sampled visible layout; see tests for fixtures).
+_DEVIN_STATUS = re.compile(r"\S(?:.*?\S)?\s+Context: [0-9.]+[kKmM]? / [0-9.]+[kKmM]? tokens \([0-9]+%\)")
+_DEVIN_RULE = re.compile(r"─+")
+_DEVIN_RULE_TOP = re.compile(r"─+( \([^()]*\) ─+)?")
+_DEVIN_SPINNER = re.compile(r"\(esc (?:(?:twice|again) )?to interrupt\)\s*$")
+_DEVIN_TOOL_HEAD = re.compile(r" [○◐◔◑◕⏺] ")
+_DEVIN_USER_CONT = re.compile(r"  \S")
+_DEVIN_TOOL_BODY = ("│", " │", " └")
+
+
+def _devin_frame(lines: list[str]) -> _Frame | None:
+    """Strictly parse the sampled real Devin CLI layout; any deviation fails closed.
+
+    Chrome: transcript rows, optional working spinner, a rule, one '❭ ' input
+    line, a rule, then the model/context status bar as the last row.
+    """
+    if (len(lines) < 5 or _DEVIN_STATUS.fullmatch(lines[-1]) is None
+            or _DEVIN_RULE.fullmatch(lines[-2]) is None
+            or not lines[-3].startswith("❭")
+            or _DEVIN_RULE_TOP.fullmatch(lines[-4]) is None):
+        return None
+    end, status = len(lines) - 4, "idle"
+    if end > 0 and _DEVIN_SPINNER.search(lines[end - 1]):
+        status, end = "working", end - 1
+    if lines[-3] == "❭ Guide Devin while it works":
+        status = "working"  # Working placeholder; same signal the agent detector uses.
+    transcript = lines[:end]
+
+    def blank(row: str) -> bool:
+        return not row.strip()
+
+    while transcript and blank(transcript[-1]):
+        transcript.pop()  # Pre-chrome blank rows are spacing, not transcript.
+    blocks: list[_Block] = []
+    i, n = 0, len(transcript)
+
+    def tail(start: int, stop: int) -> int:
+        while stop > start and blank(transcript[stop - 1]):
+            stop -= 1
+        return stop
+
+    while i < n:
+        line = transcript[i]
+        if blank(line):
+            i += 1
+            continue
+        if line.startswith("❭"):
+            j = i + 1
+            while j < n and (blank(transcript[j]) or _DEVIN_USER_CONT.match(transcript[j])):
+                j += 1
+            end_i = tail(i + 1, j)
+            echo = "".join((transcript[i][1:] + "".join(transcript[i + 1:end_i])).split())
+            blocks.append(_Block("USER", i, end_i, echo))
+        elif _DEVIN_TOOL_HEAD.match(line) or line.startswith(_DEVIN_TOOL_BODY):
+            # A scrolled window may open inside a tool block, header off-screen.
+            j = i + 1
+            while j < n and (blank(transcript[j]) or transcript[j].startswith(_DEVIN_TOOL_BODY)):
+                j += 1
+            blocks.append(_Block("TOOL", i, tail(i + 1, j), ""))
+        elif line.startswith(" "):
+            j = i + 1
+            while j < n and (blank(transcript[j])
+                             or (transcript[j].startswith(" ")
+                                 and not _DEVIN_TOOL_HEAD.match(transcript[j])
+                                 and not transcript[j].startswith(_DEVIN_TOOL_BODY))):
+                j += 1
+            end_i = tail(i + 1, j)
+            text = "\n".join(transcript[k][1:].rstrip() if transcript[k] else ""
+                             for k in range(i, end_i)).strip("\n")
+            blocks.append(_Block("ASSISTANT", i, end_i, text))
+        else:
+            return None
+        i = j
+    return _Frame(tuple("| " + row.rstrip() for row in transcript), tuple(blocks), status, True)
 
 
 def _text(value: str) -> str | None:
@@ -84,9 +162,11 @@ def _frame(kind: str, raw: str) -> _Frame | None:
     lines = text.split("\n")
     if lines and lines[-1] == "":
         lines.pop()  # One read-command trailing newline, not a transcript line.
-    if (not 5 <= len(lines) <= MAX_LINES
-            or lines[:2] != [f"[synthetic/not-live:{kind}]", "BEGIN CONTENT"]
-            or lines[-3] != "END CONTENT" or not lines[-2].startswith("input> ")
+    if not 5 <= len(lines) <= MAX_LINES:
+        return None
+    if lines[:2] != [f"[synthetic/not-live:{kind}]", "BEGIN CONTENT"]:
+        return _devin_frame(lines) if kind == "devin" else None
+    if (lines[-3] != "END CONTENT" or not lines[-2].startswith("input> ")
             or lines[-1] not in {"state=idle", "state=done", "state=working", "state=blocked", "state=unknown"}):
         return None
     rows = tuple(lines[2:-3])
@@ -117,6 +197,8 @@ def _occurrences(rows: tuple[str, ...], anchor: tuple[str, ...]) -> int:
 def _extract(before: _Frame, after: _Frame, prompt: str) -> Extraction:
     if after.status not in {"idle", "done"}:
         return Extraction(None, "not_ready")
+    if before.real is not after.real:
+        return Extraction(None, "unrecognized")
     old, new = before.rows, after.rows
     if old == new:
         return Extraction(None, "unchanged")
@@ -137,7 +219,9 @@ def _extract(before: _Frame, after: _Frame, prompt: str) -> Extraction:
     users = [block for block in added if block.role == "USER"]
     if not users:
         return Extraction(None, "waiting_for_prompt")
-    if len(users) != 1 or added[0] is not users[0] or users[0].text != prompt:
+    # Real Devin echoes hard-wrap and reflow paragraphs; compare whitespace-free.
+    want = "".join(prompt.split()) if after.real else prompt
+    if len(users) != 1 or added[0] is not users[0] or users[0].text != want:
         return Extraction(None, "ambiguous_prompt")
     if any(block.role == "APPROVAL" for block in added):
         return Extraction(None, "attention")
