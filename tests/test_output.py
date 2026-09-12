@@ -196,6 +196,9 @@ class RealDevinExtractionTests(unittest.TestCase):
         result = out.extract_new_text("devin", before, after, self.PROMPT)
         self.assertIsNone(result.body)
         self.assertEqual(result.reason, "not_ready")
+        guide = devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " partial"],
+                             input_text="Guide Devin while it works")
+        self.assertIsNone(out.extract_new_text("devin", before, guide, self.PROMPT).body)
 
     def test_wrong_echo_second_prompt_and_missing_echo_fail_closed(self):
         before = devin_screen(DEVIN_HISTORY)

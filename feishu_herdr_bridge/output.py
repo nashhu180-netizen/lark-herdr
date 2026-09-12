@@ -62,7 +62,7 @@ class _Frame:
 _DEVIN_STATUS = re.compile(r"\S(?:.*?\S)?\s+Context: [0-9.]+[kKmM]? / [0-9.]+[kKmM]? tokens \([0-9]+%\)")
 _DEVIN_RULE = re.compile(r"─+")
 _DEVIN_RULE_TOP = re.compile(r"─+( \([^()]*\) ─+)?")
-_DEVIN_SPINNER = re.compile(r"\(esc (?:twice|again) to interrupt\)\s*$")
+_DEVIN_SPINNER = re.compile(r"\(esc (?:(?:twice|again) )?to interrupt\)\s*$")
 _DEVIN_TOOL_HEAD = re.compile(r" [○◐◔◑◕⏺] ")
 _DEVIN_USER_CONT = re.compile(r"  \S")
 _DEVIN_TOOL_BODY = ("│", " │", " └")
@@ -82,6 +82,8 @@ def _devin_frame(lines: list[str]) -> _Frame | None:
     end, status = len(lines) - 4, "idle"
     if end > 0 and _DEVIN_SPINNER.search(lines[end - 1]):
         status, end = "working", end - 1
+    if lines[-3] == "❭ Guide Devin while it works":
+        status = "working"  # Working placeholder; same signal the agent detector uses.
     transcript = lines[:end]
 
     def blank(row: str) -> bool:
