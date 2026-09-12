@@ -254,6 +254,68 @@ class RealDevinExtractionTests(unittest.TestCase):
         self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\nP1_LIVE_OK")])
         self.assertEqual((watch.phase, watch.reason), ("consumed", "sent"))
 
+    def test_transient_unrecognized_frame_keeps_polling_then_sends(self):
+        # Production Issue #12: the first post-arm tick raced a redraw and a
+        # single unparseable frame killed the watch with an immediate NOTICE.
+        from dataclasses import replace
+        rig = Rig()
+        origin = rig.origin()
+        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY)
+        watch = rig.arm(origin, self.PROMPT)
+        self.assertIsNotNone(watch)
+        rig.screens[origin.pane_id] = "torn mid-redraw frame without chrome\npartial ───"
+        self.assertTrue(rig.tick())
+        self.assertEqual(rig.messages, [])
+        self.assertEqual(watch.phase, "watching")
+        rig.screens[origin.pane_id] = self.round(" P1_LIVE_OK")
+        rig.tick(2.0)
+        self.assertEqual(rig.messages, [])
+        rig.states[origin.pane_id] = replace(rig.states[origin.pane_id], status="done")
+        rig.tick(2.0)
+        self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\nP1_LIVE_OK")])
+        self.assertEqual((watch.phase, watch.reason), ("consumed", "sent"))
+
+    def test_never_parseable_frame_still_sends_notice(self):
+        # Consecutive unparseable samples beyond the tolerance still stop the
+        # watch with exactly one safe NOTICE; raw text is never sent.
+        rig = Rig()
+        origin = rig.origin()
+        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY)
+        watch = rig.arm(origin, self.PROMPT)
+        self.assertIsNotNone(watch)
+        rig.screens[origin.pane_id] = "PRIVATE UNRECOGNIZED OUTPUT"
+        rig.tick()
+        for _ in range(out.UNRECOGNIZED_POLLS - 1):
+            rig.tick(2.0)
+        self.assertEqual(rig.messages, [])
+        self.assertEqual(watch.phase, "watching")
+        rig.tick(2.0)
+        self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\n" + out.NOTICE)])
+        self.assertEqual(watch.phase, "consumed")
+        self.assertEqual(rig.invalidated, [])
+
+    def test_parseable_between_torn_frames_resets_the_tolerance(self):
+        # A good frame between unparseable ones resets the consecutive count;
+        # the watch still stops once failures persist, without waiting 120s.
+        rig = Rig()
+        origin = rig.origin()
+        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY)
+        watch = rig.arm(origin, self.PROMPT)
+        self.assertIsNotNone(watch)
+        good = devin_screen(DEVIN_HISTORY)
+        for _ in range(out.UNRECOGNIZED_POLLS - 1):
+            rig.screens[origin.pane_id] = "torn mid-redraw frame"
+            rig.tick()
+            rig.screens[origin.pane_id] = good
+            rig.tick(2.0)
+        self.assertEqual(rig.messages, [])
+        self.assertEqual(watch.phase, "watching")
+        rig.screens[origin.pane_id] = "torn mid-redraw frame"
+        for _ in range(out.UNRECOGNIZED_POLLS + 1):
+            rig.tick(2.0)
+        self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\n" + out.NOTICE)])
+        self.assertEqual(watch.phase, "consumed")
+
 
 class FormatTests(unittest.TestCase):
     def test_normal_payload_is_exactly_pane_label_and_body(self):
@@ -628,11 +690,15 @@ class ObserverTests(unittest.TestCase):
             with self.subTest(size=len(raw)):
                 r = Rig()
                 origin = r.origin()
-                r.arm(origin)
+                watch = r.arm(origin)
                 r.screens[origin.pane_id] = raw
                 r.tick()
                 r.tick(2)
+                self.assertEqual(r.messages, [])
+                self.assertEqual(watch.phase, "watching")
+                r.tick(200)
                 self.assertEqual(r.messages, [(origin, "主控 Pane pane-a\n" + out.NOTICE)])
+                self.assertEqual(watch.phase, "consumed")
                 self.assertEqual(r.invalidated, [])
 
     def test_read_failures_or_target_mismatch_invalidate_original_only_and_never_send(self):
