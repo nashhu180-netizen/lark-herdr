@@ -368,15 +368,30 @@ class RealDevinExtractionTests(unittest.TestCase):
         # Issue #16: the observed working footer may carry an optional suffix
         # after the interrupt hint; it must still parse as a working frame.
         before = devin_screen(DEVIN_HISTORY)
-        for hint in ("(esc twice to interrupt)", "(esc twice to interrupt · tab to queue)",
-                     "(esc to interrupt · enter sends queued)", "(esc again to interrupt) "):
-            spinner = "⠸ Running tools · 0m 3s " + hint
-            with self.subTest(hint=hint):
+        for spinner in ("⠸ Running tools · 0m 3s (esc twice to interrupt)",
+                        "⠸ Running tools · 0m 3s (esc twice to interrupt · tab to queue)",
+                        "⠸ Running tools · 0m 3s (esc to interrupt · enter sends queued)",
+                        "⠸ Running tools · 0m 3s (esc again to interrupt) ",
+                        # Sanitized shape of the actual w15:p1 footer: the
+                        # interrupt group, a separator, then a second
+                        # parenthesized detail group.
+                        "⠸ Thinking · 0m 3s (esc twice to interrupt) · "
+                        "(detail · ctrl+o for details · alt+t to toggle)"):
+            with self.subTest(spinner=spinner):
                 after = devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " partial"],
                                      status="working", spinner=spinner)
                 result = out.extract_new_text("devin", before, after, self.PROMPT)
                 self.assertIsNone(result.body)
                 self.assertEqual(result.reason, "not_ready")
+        for spinner in ("⠸ Thinking · 0m 3s (esc twice to interrupt) · (a) · (b)",
+                        "⠸ Thinking · 0m 3s (esc twice to interrupt) · (unclosed",
+                        "⠸ Thinking · 0m 3s (esc twice to interrupt) · ((nested))",
+                        "⠸ Thinking · 0m 3s (esc twice to interrupt)extra"):
+            with self.subTest(spinner=spinner):
+                after = devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " partial"],
+                                     status="working", spinner=spinner)
+                self.assertEqual(out.extract_new_text("devin", before, after, self.PROMPT).reason,
+                                 "unrecognized")
 
     def test_guidance_sent_while_working_arms_and_sends_final_body(self):
         # Issue #16: a prompt submitted while the bound pane is working still

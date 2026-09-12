@@ -69,7 +69,8 @@ class _Frame:
 _DEVIN_STATUS = re.compile(r"\S(?:.*?\S)?\s+Context: [0-9.]+[kKmM]? / [0-9.]+[kKmM]? tokens \([0-9]+%\)")
 _DEVIN_RULE = re.compile(r"─+")
 _DEVIN_RULE_TOP = re.compile(r"─+( \([^()]*\) ─+)?")
-_DEVIN_SPINNER = re.compile(r"\(esc (?:(?:twice|again) )?to interrupt[^()]*\)(\s[^()]*)?$")
+_DEVIN_SPINNER = re.compile(r"\(esc (?:(?:twice|again) )?to interrupt[^()]*\)"
+                            r"(?:\s[^()]*\([^()]*\))?(\s[^()]*)?$")
 _DEVIN_TOOL_HEAD = re.compile(r" [○◐◔◑◕⏺] ")
 _DEVIN_USER_CONT = re.compile(r"  \S")
 _DEVIN_TOOL_BODY = ("│", " │", " └")
