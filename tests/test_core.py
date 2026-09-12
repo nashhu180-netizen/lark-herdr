@@ -117,7 +117,7 @@ class CoreTests(unittest.TestCase):
         prompt = [e for e in self.fake.events("call") if e["argv"][1] == "prompt"][0]
         self.assertEqual(prompt["argv"], ["agent", "prompt", "pane-a", body])
 
-    def test_working_devin_exact_queue_is_confirmed_once(self):
+    def test_working_devin_exact_queue_is_left_for_native_queue(self):
         state = self.fake.load()
         agent = state["sessions"][SESSION]["agents"]["pane-a"]
         agent.update(kind="devin", status="working")
@@ -134,8 +134,7 @@ class CoreTests(unittest.TestCase):
         self.fake.save(state)
         self.bind()
         self.assertEqual(self.send(prompt).code, "submitted")
-        self.assertEqual([(e["pane_id"], e["key"]) for e in self.fake.events("key")],
-                         [("pane-a", "enter")])
+        self.assertEqual(self.fake.events("key"), [])
 
     def test_leading_hyphen_is_rejected_until_live_verified(self):
         self.bind()
