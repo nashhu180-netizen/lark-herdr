@@ -989,6 +989,30 @@ class ObserverTests(unittest.TestCase):
                 self.assertEqual(r.messages, [])
                 self.assertEqual(r.phases[origin], "processing")
 
+    def test_working_devin_retries_one_torn_baseline_without_guessing(self):
+        from dataclasses import replace
+        r = Rig()
+        origin = r.origin()
+        r.states[origin.pane_id] = replace(r.states[origin.pane_id], status="working")
+        valid = devin_screen(
+            DEVIN_HISTORY + ["", " ○ Running command", " │ $ sleep 40", " │ Timeout: 0ms"],
+            status="working",
+            spinner="⠐⠒ Running tools · 12s (esc twice to interrupt)",
+            activity="10 subagents · ↓ select",
+        )
+        samples = iter(["torn mid-redraw frame", valid])
+        r.on_read = lambda pane: r.screens.__setitem__(pane, next(samples))
+        watch = r.arm(origin)
+        self.assertIsNotNone(watch)
+        self.assertEqual([call[0] for call in r.calls], ["get", "read", "read"])
+
+        r = Rig()
+        origin = r.origin()
+        r.states[origin.pane_id] = replace(r.states[origin.pane_id], status="working")
+        r.screens[origin.pane_id] = "still torn"
+        self.assertIsNone(r.observer.capture(origin, "task"))
+        self.assertEqual([call[0] for call in r.calls], ["get", "read", "read"])
+
     def test_guard_revocation_before_read_during_read_and_before_send_discards(self):
         for point in ("before_get", "during_get", "during_read", "attempted"):
             with self.subTest(point=point):

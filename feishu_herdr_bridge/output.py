@@ -444,7 +444,14 @@ class OutputObserver:
             if (not self._matches(origin, state) or state.status not in {"idle", "done", "working"}
                     or not self._allowed(origin, "processing")):
                 return None
-            before = _frame(origin.kind, self._read(origin.pane_id))
+            before = None
+            attempts = 2 if origin.kind == "devin" and state.status == "working" else 1
+            for _ in range(attempts):
+                before = _frame(origin.kind, self._read(origin.pane_id))
+                if before is not None and before.status in {"idle", "done", "working"}:
+                    break
+                if not self._allowed(origin, "processing"):
+                    return None
             if (before is None or before.status not in {"idle", "done", "working"}
                     or not self._allowed(origin, "processing")):
                 return None
