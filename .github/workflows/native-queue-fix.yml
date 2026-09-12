@@ -2,8 +2,7 @@ name: native-devin-queue-red-green
 
 on:
   push:
-    branches:
-      - fix/native-devin-queue-wait
+    branches: [fix/native-devin-queue-wait]
 
 permissions:
   contents: write
@@ -21,7 +20,7 @@ jobs:
           python-version: '3.11'
       - name: Install
         run: python -m pip install -e .
-      - name: Behavior red
+      - name: Red then repair
         shell: bash
         run: |
           set -euo pipefail
@@ -31,56 +30,42 @@ jobs:
           from pathlib import Path
           p = Path('tests/test_core.py')
           s = p.read_text()
-          old = '''    def test_working_devin_exact_queue_is_confirmed_once(self):\n'''
-          new = '''    def test_working_devin_exact_queue_is_left_for_native_queue(self):\n'''
+          s = s.replace('    def test_working_devin_exact_queue_is_confirmed_once(self):\n',
+                        '    def test_working_devin_exact_queue_is_left_for_native_queue(self):\n', 1)
+          old = '''        self.assertEqual([(e["pane_id"], e["key"]) for e in self.fake.events("key")],\n                         [("pane-a", "enter")])\n'''
           if old not in s:
-              raise SystemExit('missing old queue test name')
-          s = s.replace(old, new, 1)
-          old_assert = '''        self.assertEqual([(e["pane_id"], e["key"]) for e in self.fake.events("key")],\n                         [("pane-a", "enter")])\n'''
-          new_assert = '''        self.assertEqual(self.fake.events("key"), [])\n'''
-          if old_assert not in s:
-              raise SystemExit('missing old queue Enter assertion')
-          p.write_text(s.replace(old_assert, new_assert, 1))
+              raise SystemExit('missing legacy Enter assertion')
+          p.write_text(s.replace(old, '        self.assertEqual(self.fake.events("key"), [])\n', 1))
           PY
           git add tests/test_core.py
           git commit -m "test: require native Devin queue to remain untouched"
           set +e
-          python -m unittest tests.test_core.CoreTests.test_working_devin_exact_queue_is_left_for_native_queue > /tmp/native-queue-red.log 2>&1
+          python -m unittest tests.test_core.CoreTests.test_working_devin_exact_queue_is_left_for_native_queue > /tmp/red.log 2>&1
           red_rc=$?
           set -e
-          cat /tmp/native-queue-red.log
-          if [ "$red_rc" -eq 0 ]; then
-            echo "expected behavior-red failure, but test passed"
-            exit 1
-          fi
-      - name: Minimal repair
-        shell: bash
-        run: |
-          set -euo pipefail
+          cat /tmp/red.log
+          test "$red_rc" -ne 0
+
           python - <<'PY'
           from pathlib import Path
           import re
 
           p = Path('feishu_herdr_bridge/core.py')
-          s = p.read_text()
-          s = s.replace('from .output import Observation, Origin, OutputObserver, queued_devin_prompt\n',
-                        'from .output import Observation, Origin, OutputObserver\n', 1)
-          pattern = re.compile(
-              r'        if agent\.kind == "devin" and agent\.status == "working":\n'
-              r'(?:.*\n){0,20}?'
-              r'            except Exception:\n'
-              r'                pass\n'
-          )
-          s2, n = pattern.subn('', s, count=1)
+          s = p.read_text().replace(
+              'from .output import Observation, Origin, OutputObserver, queued_devin_prompt\n',
+              'from .output import Observation, Origin, OutputObserver\n', 1)
+          s, n = re.subn(
+              r'        if agent\.kind == "devin" and agent\.status == "working":\n(?:.*\n){0,20}?            except Exception:\n                pass\n',
+              '', s, count=1)
           if n != 1:
-              raise SystemExit(f'core queue-enter block removal count={n}')
-          p.write_text(s2)
+              raise SystemExit(f'queue-enter block removal count={n}')
+          p.write_text(s)
 
           p = Path('feishu_herdr_bridge/herdr.py')
           s = p.read_text()
           block = '''    def send_enter(self, pane_id: str) -> None:\n        """Confirm an already-verified interactive agent queue entry."""\n        self._check_target(pane_id)\n        process = self._run(("agent", "send-keys", pane_id, "enter"), writing=True)\n        if process.returncode != 0:\n            raise HerdrError("send_keys_failed", uncertain=True)\n\n'''
           if block not in s:
-              raise SystemExit('missing send_enter adapter block')
+              raise SystemExit('missing send_enter block')
           p.write_text(s.replace(block, '', 1))
 
           p = Path('tests/fake_herdr.py')
@@ -92,46 +77,38 @@ jobs:
 
           p = Path('tests/test_herdr.py')
           s = p.read_text()
-          s2 = s.replace('        self.adapter.send_enter("pane-b")\n', '', 1)
-          s2 = s2.replace('            ["agent", "send-keys", "pane-b", "enter"],\n', '', 1)
-          if s2 == s:
-              raise SystemExit('missing test_herdr send_enter expectations')
-          p.write_text(s2)
+          s = s.replace('        self.adapter.send_enter("pane-b")\n', '', 1)
+          s = s.replace('            ["agent", "send-keys", "pane-b", "enter"],\n', '', 1)
+          p.write_text(s)
 
           p = Path('feishu_herdr_bridge/output.py')
           s = p.read_text()
-          pattern = re.compile(
-              r'\ndef queued_devin_prompt\(raw: str, prompt: str\) -> bool:\n'
-              r'(?:.*\n)*?'
-              r'(?=\ndef _text\(value: str\) -> str \| None:)'
-          )
-          s2, n = pattern.subn('\n', s, count=1)
+          s, n = re.subn(
+              r'\ndef queued_devin_prompt\(raw: str, prompt: str\) -> bool:\n(?:.*\n)*?(?=\ndef _text\(value: str\) -> str \| None:)',
+              '\n', s, count=1)
           if n != 1:
-              raise SystemExit(f'queued_devin_prompt removal count={n}')
-          p.write_text(s2)
+              raise SystemExit(f'queued helper removal count={n}')
+          p.write_text(s)
 
           p = Path('tests/test_output.py')
-          s = p.read_text()
-          s = s.replace(
+          s = p.read_text().replace(
               '    def test_single_exact_queued_guidance_is_working_chrome_and_confirmable(self):\n',
               '    def test_single_exact_queued_guidance_is_working_chrome_and_waits_fail_closed(self):\n', 1)
           for line in (
               '        self.assertTrue(out.queued_devin_prompt(queued, self.PROMPT))\n',
               '        self.assertFalse(out.queued_devin_prompt(queued, "different guidance"))\n',
               '        self.assertFalse(out.queued_devin_prompt(queued, self.PROMPT + "\\nextra"))\n',
-              '        self.assertFalse(out.queued_devin_prompt(malformed, self.PROMPT))\n',
-          ):
+              '        self.assertFalse(out.queued_devin_prompt(malformed, self.PROMPT))\n'):
               if line not in s:
-                  raise SystemExit('missing queued helper assertion: ' + line.strip())
+                  raise SystemExit('missing helper assertion')
               s = s.replace(line, '', 1)
           marker = '    def test_guidance_sent_while_working_arms_and_sends_final_body(self):\n'
+          new_test = '''    def test_queued_guidance_waits_then_naturally_returns_final_body(self):\n        from dataclasses import replace\n        rig = Rig()\n        origin = rig.origin()\n        rig.states[origin.pane_id] = replace(rig.states[origin.pane_id], status="working")\n        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY, status="working")\n        watch = rig.arm(origin, self.PROMPT)\n        self.assertIsNotNone(watch)\n\n        rig.screens[origin.pane_id] = devin_queued_screen(\n            DEVIN_HISTORY, self.PROMPT, "3 subagents · ↓ select"\n        )\n        self.assertTrue(rig.tick())\n        self.assertEqual(rig.messages, [])\n        self.assertEqual(watch.phase, "watching")\n\n        rig.states[origin.pane_id] = replace(rig.states[origin.pane_id], status="done")\n        rig.screens[origin.pane_id] = devin_screen(\n            DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " P1_LIVE_OK"]\n        )\n        rig.tick(2.0)\n        self.assertEqual(rig.messages, [])\n        rig.tick(2.0)\n        self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\\nP1_LIVE_OK")])\n        self.assertEqual((watch.phase, watch.reason), ("consumed", "sent"))\n\n'''
           if marker not in s:
-              raise SystemExit('missing guidance test insertion marker')
-          new_test = '''    def test_queued_guidance_waits_then_naturally_returns_final_body(self):\n        from dataclasses import replace\n        rig = Rig()\n        origin = rig.origin()\n        rig.states[origin.pane_id] = replace(rig.states[origin.pane_id], status="working")\n        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY, status="working")\n        watch = rig.arm(origin, self.PROMPT)\n        self.assertIsNotNone(watch)\n\n        rig.screens[origin.pane_id] = devin_queued_screen(\n            DEVIN_HISTORY, self.PROMPT, "3 subagents · ↓ select"\n        )\n        self.assertTrue(rig.tick())\n        self.assertEqual(rig.messages, [])\n        self.assertEqual(watch.phase, "armed")\n\n        rig.states[origin.pane_id] = replace(rig.states[origin.pane_id], status="done")\n        rig.screens[origin.pane_id] = devin_screen(\n            DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " P1_LIVE_OK"]\n        )\n        rig.tick(2.0)\n        self.assertEqual(rig.messages, [])\n        rig.tick(2.0)\n        self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\\nP1_LIVE_OK")])\n        self.assertEqual((watch.phase, watch.reason), ("consumed", "sent"))\n\n'''
+              raise SystemExit('missing output test marker')
           p.write_text(s.replace(marker, new_test + marker, 1))
           PY
       - name: Targeted and full tests
-        shell: bash
         run: |
           set -euo pipefail
           python -m unittest tests.test_output tests.test_core tests.test_herdr
@@ -140,7 +117,6 @@ jobs:
           python -m pip check
           git diff --check
       - name: Commit and push repair
-        shell: bash
         run: |
           set -euo pipefail
           rm .github/workflows/native-queue-fix.yml
