@@ -285,7 +285,55 @@ class RealDevinExtractionTests(unittest.TestCase):
         self.assertIsNotNone(watch)
         rig.screens[origin.pane_id] = "PRIVATE UNRECOGNIZED OUTPUT"
         rig.tick()
-        for _ in range(out.UNRECOGNIZED_POLLS - 1):
+        for _ in range(out.TRANSIENT_POLLS - 1):
+            rig.tick(2.0)
+        self.assertEqual(rig.messages, [])
+        self.assertEqual(watch.phase, "watching")
+        rig.tick(2.0)
+        self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\n" + out.NOTICE)])
+        self.assertEqual(watch.phase, "consumed")
+        self.assertEqual(rig.invalidated, [])
+
+    def test_transient_ambiguous_overlap_keeps_polling_then_sends(self):
+        # Issue #14: a mid-redraw/mid-scroll frame whose transcript shares no
+        # provable overlap with the baseline must not kill the watch.
+        from dataclasses import replace
+        rig = Rig()
+        origin = rig.origin()
+        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY)
+        watch = rig.arm(origin, self.PROMPT)
+        self.assertIsNotNone(watch)
+        # Parses as a real Devin frame but has zero provable overlap with the
+        # baseline -> ambiguous_overlap, must be non-terminal.
+        rig.screens[origin.pane_id] = devin_screen(
+            [" ⏺ Ran command", " │ $ unrelated streaming output",
+             " │ partial view", " └ Exited with code 0"])
+        self.assertTrue(rig.tick())
+        self.assertEqual(rig.messages, [])
+        self.assertEqual(watch.phase, "watching")
+        rig.screens[origin.pane_id] = self.round(" P1_LIVE_OK")
+        rig.tick(2.0)
+        self.assertEqual(rig.messages, [])
+        rig.states[origin.pane_id] = replace(rig.states[origin.pane_id], status="done")
+        rig.tick(2.0)
+        self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\nP1_LIVE_OK")])
+        self.assertEqual((watch.phase, watch.reason), ("consumed", "sent"))
+
+    def test_persistent_ambiguous_overlap_sends_one_notice(self):
+        # The overlap anchor stays non-unique (the new turn re-ran an identical
+        # tool block, so the shared tail occurs twice) -> never provable; the
+        # watch still stops with exactly one safe notice.
+        rig = Rig()
+        origin = rig.origin()
+        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY)
+        watch = rig.arm(origin, self.PROMPT)
+        self.assertIsNotNone(watch)
+        shifted = devin_screen(DEVIN_HISTORY[4:] + ["", "❭ " + self.PROMPT, "", " ⏺ Ran command",
+                                                  " │ $ some command", " │ output line",
+                                                  " └ Exited with code 0"])
+        rig.screens[origin.pane_id] = shifted
+        rig.tick()
+        for _ in range(out.TRANSIENT_POLLS - 1):
             rig.tick(2.0)
         self.assertEqual(rig.messages, [])
         self.assertEqual(watch.phase, "watching")
@@ -303,7 +351,7 @@ class RealDevinExtractionTests(unittest.TestCase):
         watch = rig.arm(origin, self.PROMPT)
         self.assertIsNotNone(watch)
         good = devin_screen(DEVIN_HISTORY)
-        for _ in range(out.UNRECOGNIZED_POLLS - 1):
+        for _ in range(out.TRANSIENT_POLLS - 1):
             rig.screens[origin.pane_id] = "torn mid-redraw frame"
             rig.tick()
             rig.screens[origin.pane_id] = good
@@ -311,7 +359,7 @@ class RealDevinExtractionTests(unittest.TestCase):
         self.assertEqual(rig.messages, [])
         self.assertEqual(watch.phase, "watching")
         rig.screens[origin.pane_id] = "torn mid-redraw frame"
-        for _ in range(out.UNRECOGNIZED_POLLS + 1):
+        for _ in range(out.TRANSIENT_POLLS + 1):
             rig.tick(2.0)
         self.assertEqual(rig.messages, [(origin, f"主控 Pane {origin.pane_id}\n" + out.NOTICE)])
         self.assertEqual(watch.phase, "consumed")
