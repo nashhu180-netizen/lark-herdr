@@ -69,7 +69,12 @@ class _Frame:
 _DEVIN_STATUS = re.compile(r"\S(?:.*?\S)?\s+Context: [0-9.]+[kKmM]? / [0-9.]+[kKmM]? tokens \([0-9]+%\)")
 _DEVIN_RULE = re.compile(r"─+")
 _DEVIN_RULE_TOP = re.compile(r"─+( \([^()]*\) ─+)?")
-_DEVIN_SPINNER = re.compile(r"\(esc (?:(?:twice|again) )?to interrupt\)\s*$")
+_DEVIN_SPINNER = re.compile(r"\(esc (?:(?:twice|again) )?to interrupt[^()]*\)"
+                            r"(?:\s[^()]*\([^()]*\))?(\s[^()]*)?$")
+_DEVIN_ACTIVITY = re.compile(
+    r"(?:(?:[1-9][0-9]* subagents?)(?: · [1-9][0-9]* shells?)?"
+    r"|[1-9][0-9]* shells?) · ↓ select"
+)
 _DEVIN_TOOL_HEAD = re.compile(r" [○◐◔◑◕⏺] ")
 _DEVIN_USER_CONT = re.compile(r"  \S")
 _DEVIN_TOOL_BODY = ("│", " │", " └")
@@ -81,15 +86,18 @@ def _devin_frame(lines: list[str]) -> _Frame | None:
     Chrome: transcript rows, optional working spinner, a rule, one '❭ ' input
     line, a rule, then the model/context status bar as the last row.
     """
-    if (len(lines) < 5 or _DEVIN_STATUS.fullmatch(lines[-1]) is None
-            or _DEVIN_RULE.fullmatch(lines[-2]) is None
-            or not lines[-3].startswith("❭")
-            or _DEVIN_RULE_TOP.fullmatch(lines[-4]) is None):
+    chrome_end = len(lines)
+    if lines and _DEVIN_ACTIVITY.fullmatch(lines[-1]) is not None:
+        chrome_end -= 1
+    if (chrome_end < 5 or _DEVIN_STATUS.fullmatch(lines[chrome_end - 1]) is None
+            or _DEVIN_RULE.fullmatch(lines[chrome_end - 2]) is None
+            or not lines[chrome_end - 3].startswith("❭")
+            or _DEVIN_RULE_TOP.fullmatch(lines[chrome_end - 4]) is None):
         return None
-    end, status = len(lines) - 4, "idle"
+    end, status = chrome_end - 4, "idle"
     if end > 0 and _DEVIN_SPINNER.search(lines[end - 1]):
         status, end = "working", end - 1
-    if lines[-3] == "❭ Guide Devin while it works":
+    if lines[chrome_end - 3] == "❭ Guide Devin while it works":
         status = "working"  # Working placeholder; same signal the agent detector uses.
     transcript = lines[:end]
 
@@ -228,11 +236,15 @@ def _extract(before: _Frame, after: _Frame, prompt: str) -> Extraction:
         return Extraction(None, "waiting_for_prompt")
     # Real Devin echoes hard-wrap and reflow paragraphs; compare whitespace-free.
     want = "".join(prompt.split()) if after.real else prompt
-    if len(users) != 1 or added[0] is not users[0] or users[0].text != want:
+    mine = added.index(users[0])
+    # A working baseline may have in-flight output legitimately precede the
+    # guidance echo; only an idle/done baseline must echo as the first new block.
+    if (len(users) != 1 or (before.status != "working" and mine != 0)
+            or users[0].text != want):
         return Extraction(None, "ambiguous_prompt")
     if any(block.role == "APPROVAL" for block in added):
         return Extraction(None, "attention")
-    body = "\n\n".join(block.text for block in added[1:]
+    body = "\n\n".join(block.text for block in added[mine + 1:]
                        if block.role == "ASSISTANT" and block.text.strip())
     if not body or body == prompt:
         return Extraction(None, "echo_only")
@@ -242,7 +254,7 @@ def _extract(before: _Frame, after: _Frame, prompt: str) -> Extraction:
 def extract_new_text(kind: str, baseline: str, current: str, prompt: str) -> Extraction:
     """No generic screen diff fallback; source labels are not live compatibility."""
     before, after, expected = _frame(kind, baseline), _frame(kind, current), _prompt(prompt)
-    if before is None or after is None or expected is None or before.status not in {"idle", "done"}:
+    if before is None or after is None or expected is None or before.status not in {"idle", "done", "working"}:
         return Extraction(None, "unrecognized")
     return _extract(before, after, expected)
 
@@ -412,11 +424,11 @@ class OutputObserver:
             return None
         try:
             state = self._get(origin.pane_id)
-            if (not self._matches(origin, state) or state.status not in {"idle", "done"}
+            if (not self._matches(origin, state) or state.status not in {"idle", "done", "working"}
                     or not self._allowed(origin, "processing")):
                 return None
             before = _frame(origin.kind, self._read(origin.pane_id))
-            if (before is None or before.status not in {"idle", "done"}
+            if (before is None or before.status not in {"idle", "done", "working"}
                     or not self._allowed(origin, "processing")):
                 return None
         except Exception:
