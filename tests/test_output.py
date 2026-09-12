@@ -50,6 +50,16 @@ def devin_screen(transcript, status="idle", input_text=None, spinner=DEVIN_SPINN
     return "\n".join(lines) + "\n"
 
 
+def devin_queued_screen(transcript, prompt, activity=None):
+    lines = list(transcript) + ["", DEVIN_SPINNER,
+        "── 1 queued " + "─" * 20 + " ↑ edit · ↵ send now ──",
+        "○ " + prompt, DEVIN_RULE_TOP, "❭ Press Enter to send queued messages now",
+        DEVIN_RULE_BOTTOM, DEVIN_STATUS]
+    if activity is not None:
+        lines.append(activity)
+    return "\n".join(lines) + "\n"
+
+
 class ExtractionTests(unittest.TestCase):
     def test_complete_new_user_and_body_extracts_exact_unicode_answer(self):
         first = FIXTURE["rounds"][0]
@@ -417,6 +427,23 @@ class RealDevinExtractionTests(unittest.TestCase):
                 after = devin_screen(DEVIN_HISTORY, status="working", activity=activity)
                 self.assertEqual(out.extract_new_text("devin", before, after, self.PROMPT).reason,
                                  "unrecognized")
+
+    def test_single_exact_queued_guidance_is_working_chrome_and_confirmable(self):
+        before = devin_screen(DEVIN_HISTORY)
+        queued = devin_queued_screen(
+            DEVIN_HISTORY, self.PROMPT, "3 subagents · ↓ select"
+        )
+        result = out.extract_new_text("devin", before, queued, self.PROMPT)
+        self.assertIsNone(result.body)
+        self.assertEqual(result.reason, "not_ready")
+        self.assertTrue(out.queued_devin_prompt(queued, self.PROMPT))
+        self.assertFalse(out.queued_devin_prompt(queued, "different guidance"))
+        self.assertFalse(out.queued_devin_prompt(queued, self.PROMPT + "\nextra"))
+
+        malformed = queued.replace("── 1 queued ", "── 2 queued ", 1)
+        self.assertEqual(out.extract_new_text("devin", before, malformed, self.PROMPT).reason,
+                         "unrecognized")
+        self.assertFalse(out.queued_devin_prompt(malformed, self.PROMPT))
 
     def test_guidance_sent_while_working_arms_and_sends_final_body(self):
         # Issue #16: a prompt submitted while the bound pane is working still

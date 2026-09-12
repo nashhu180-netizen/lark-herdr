@@ -302,6 +302,13 @@ class HerdrAdapter:
         if result.agents:
             raise HerdrError("invalid_output", uncertain=True)
 
+    def send_enter(self, pane_id: str) -> None:
+        """Confirm an already-verified interactive agent queue entry."""
+        self._check_target(pane_id)
+        process = self._run(("agent", "send-keys", pane_id, "enter"), writing=True)
+        if process.returncode != 0:
+            raise HerdrError("send_keys_failed", uncertain=True)
+
     def create_workspace(self, cwd: str, label: str) -> Workspace:
         if not isinstance(cwd, str) or not Path(cwd).is_absolute() or not safe_text(cwd) or "\n" in cwd:
             raise HerdrError("invalid_project")

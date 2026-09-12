@@ -55,11 +55,13 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.adapter.get_agent("pane-a").workspace_id, "workspace-a")
         self.assertEqual(self.adapter.read_agent("pane-a"), "screen-A\n")
         self.adapter.prompt("pane-b", "任务\n第二行")
+        self.adapter.send_enter("pane-b")
         self.assertEqual([event["argv"] for event in self.fake.events("call")], [
             ["agent", "list"],
             ["agent", "get", "pane-a"],
             ["agent", "read", "pane-a", "--source", "visible", "--lines", "80", "--format", "text"],
             ["agent", "prompt", "pane-b", "任务\n第二行"],
+            ["agent", "send-keys", "pane-b", "enter"],
         ])
         self.assertTrue(all(event["session"] == SESSION for event in self.fake.events()))
 
