@@ -676,7 +676,10 @@ class OutputHTTPTests(unittest.TestCase):
         guarded_model = patch("feishu_herdr_bridge.feishu.build_text_request", side_effect=model)
         guarded_model.start()
         self.addCleanup(guarded_model.stop)
-        transport_factory = patch("httpx.AsyncHTTPTransport", wraps=httpx.AsyncHTTPTransport)
+        # Resolve the real class before wraps replaces the module attribute;
+        # handle_async_request must be patched on the class instances get.
+        real_transport = httpx.AsyncHTTPTransport
+        transport_factory = patch("httpx.AsyncHTTPTransport", wraps=real_transport)
         self.transports = transport_factory.start()
         self.addCleanup(transport_factory.stop)
         violations = []
@@ -708,7 +711,7 @@ class OutputHTTPTests(unittest.TestCase):
             except AssertionError as error:
                 violations.append(str(error))
                 raise
-        network = patch("httpx.AsyncHTTPTransport.handle_async_request", new=boundary)
+        network = patch.object(real_transport, "handle_async_request", new=boundary)
         network.start()
         self.addCleanup(network.stop)
         self.addCleanup(lambda: self.assertEqual(violations, []))
