@@ -32,9 +32,13 @@ CAPACITY = 16
 LIFETIME = 120.0
 INTERVAL = 2.0
 MAX_POLLS = 60
-# Consecutive unparseable samples tolerated per watch; a live TUI may emit a
-# torn frame mid-redraw, but a persistently foreign layout still stops fast.
-UNRECOGNIZED_POLLS = 5
+# Consecutive unverifiable samples tolerated per watch; a live TUI may emit a
+# torn frame mid-redraw or a shifted overlap mid-scroll, but a persistently
+# foreign or unattributable layout still stops fast. ambiguous_prompt and
+# attention stay terminal: a different user block or an approval card is
+# evidence of external input, not redraw noise.
+TRANSIENT_POLLS = 5
+TRANSIENT_REASONS = frozenset({"unrecognized", "ambiguous_overlap", "partial_block"})
 NOTICE = "本次自动回传已停止，可用 /read 查看当前画面"
 TRUNCATED = "[已截断；可用 /read 查看当前画面]"
 
@@ -296,7 +300,7 @@ class Observation:
     _prompt: str = ""
     _candidate: str | None = None
     _candidate_at: float = 0.0
-    _unrecognized: int = 0
+    _transient: int = 0
 
 
 class OutputObserver:
@@ -500,7 +504,7 @@ class OutputObserver:
                     return True
                 if state.status == "working":
                     watch._candidate = None
-                    watch._unrecognized = 0
+                    watch._transient = 0
                     return True
                 if state.status not in {"idle", "done"}:
                     self._deliver(watch, NOTICE, "attention")
@@ -523,16 +527,16 @@ class OutputObserver:
                       else Extraction(None, "unrecognized"))
             if result.body is None:
                 watch._candidate = None
-                if result.reason == "unrecognized":
-                    watch._unrecognized += 1
-                    if watch._unrecognized <= UNRECOGNIZED_POLLS:
+                if result.reason in TRANSIENT_REASONS:
+                    watch._transient += 1
+                    if watch._transient <= TRANSIENT_POLLS:
                         return True
                 else:
-                    watch._unrecognized = 0
+                    watch._transient = 0
                 if result.reason not in {"unchanged", "waiting_for_prompt", "echo_only", "not_ready"}:
                     self._deliver(watch, NOTICE, result.reason)
                 return True
-            watch._unrecognized = 0
+            watch._transient = 0
             if watch._candidate == result.body and now - watch._candidate_at >= INTERVAL:
                 self._deliver(watch, result.body, "body")
             else:
