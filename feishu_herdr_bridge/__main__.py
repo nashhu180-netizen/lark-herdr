@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from .core import BridgeCore
+from .core import BridgeCore, connect_send_queue
 from .feishu import Credentials, FeishuBridge, LarkTransport
 from .herdr import HerdrAdapter, ManagedRunner, decode_protocol22, safe_identifier, session_command
 from .store import Store
@@ -65,7 +65,8 @@ class BridgeRuntime:
     """Admission gate and lifetime tracking around the existing Feishu bridge."""
 
     def __init__(self, core: BridgeCore, bot_open_id: str, send, runner: ManagedRunner,
-                 *, output_reader=None, send_output=None) -> None:
+                 *, output_reader=None, send_output=None, queue_adapter=None,
+                 queue_interval: float = 2.0, queue_timeout: float = 600.0) -> None:
         self.stopping = False
         self.runner = runner
         self._guard = threading.Lock()
@@ -73,12 +74,20 @@ class BridgeRuntime:
         self.bridge = FeishuBridge(core, bot_open_id, send, thread_factory=self._worker)
         self.output = (connect_output(core, output_reader, send_output, stopping=lambda: self.stopping)
                        if output_reader is not None and send_output is not None else None)
+        self.queue = (connect_send_queue(core, queue_adapter, send_output,
+                                         interval=queue_interval, timeout=queue_timeout,
+                                         stopping=lambda: self.stopping)
+                      if queue_adapter is not None and send_output is not None else None)
         self._output_thread: threading.Thread | None = None
+        self._queue_thread: threading.Thread | None = None
 
     def start_output(self) -> None:
         if self.output is not None and self._output_thread is None and not self.stopping:
             self._output_thread = threading.Thread(target=self.output.run, name="pane-output", daemon=True)
             self._output_thread.start()
+        if self.queue is not None and self._queue_thread is None and not self.stopping:
+            self._queue_thread = threading.Thread(target=self.queue.run, name="send-queue", daemon=True)
+            self._queue_thread.start()
 
     def _worker(self, *, target, args, daemon):
         def execute():
@@ -104,6 +113,8 @@ class BridgeRuntime:
         self.stopping = True
         if self.output is not None:
             self.output.request_stop()
+        if self.queue is not None:
+            self.queue.request_stop()
         reaped = self.runner.stop()
         deadline = time.monotonic() + 3.0
         with self._guard:
@@ -111,13 +122,17 @@ class BridgeRuntime:
         for worker in workers:
             if worker.ident is not None:
                 worker.join(max(0.0, deadline - time.monotonic()))
-        if self._output_thread is not None and self._output_thread.ident is not None:
-            self._output_thread.join(max(0.0, deadline - time.monotonic()))
+        for thread in (self._output_thread, self._queue_thread):
+            if thread is not None and thread.ident is not None:
+                thread.join(max(0.0, deadline - time.monotonic()))
         if (not reaped or any(worker.is_alive() for worker in workers)
-                or (self._output_thread is not None and self._output_thread.is_alive())):
+                or (self._output_thread is not None and self._output_thread.is_alive())
+                or (self._queue_thread is not None and self._queue_thread.is_alive())):
             raise RuntimeError("Shutdown did not complete within the local grace period")
         if self.output is not None:
             self.output.stop()  # Workers are quiescent; clear all remaining captures without sending.
+        if self.queue is not None:
+            self.queue.stop()  # Pending entries stay 'processing'; recovery marks 'interrupted'.
 
 
 @contextmanager
@@ -153,12 +168,15 @@ class Config:
     write_timeout: float
     management_chat_id: str | None = None
     admin_users: frozenset[str] = frozenset()
+    queue_interval: float = 2.0
+    queue_timeout: float = 600.0
 
 
 def load_config(path: Path) -> Config:
     raw = json.loads(path.read_text(encoding="utf-8"))
     required = {"herdr_executable", "herdr_session", "bot_open_id", "allowed_users", "allowed_chats", "projects"}
-    optional = {"database", "query_timeout", "write_timeout", "management_chat_id", "admin_users"}
+    optional = {"database", "query_timeout", "write_timeout", "management_chat_id", "admin_users",
+                "queue_interval", "queue_timeout"}
     if not isinstance(raw, dict) or not required <= raw.keys() or raw.keys() - required - optional:
         raise ValueError("Invalid configuration keys; credentials must be supplied through the environment")
     executable, session = raw["herdr_executable"], raw["herdr_session"]
@@ -186,12 +204,13 @@ def load_config(path: Path) -> Config:
     database = raw.get("database", str(Path.home() / ".local/state/feishu-herdr-bridge/bridge.sqlite3"))
     if not isinstance(database, str) or not Path(database).is_absolute():
         raise ValueError("Database must use an absolute path")
-    timeouts = (raw.get("query_timeout", 5.0), raw.get("write_timeout", 15.0))
+    timeouts = (raw.get("query_timeout", 5.0), raw.get("write_timeout", 15.0),
+                raw.get("queue_interval", 2.0), raw.get("queue_timeout", 600.0))
     if any(type(t) not in (int, float) or not math.isfinite(t) or t <= 0 for t in timeouts):
         raise ValueError("Timeouts must be finite positive numbers")
     return Config(executable, session, raw["bot_open_id"], frozenset(raw["allowed_users"]),
-                  frozenset(raw["allowed_chats"]), projects, Path(database), *timeouts,
-                  management, frozenset(admins))
+                  frozenset(raw["allowed_chats"]), projects, Path(database), *timeouts[:2],
+                  management, frozenset(admins), *timeouts[2:])
 
 
 def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None) -> int:
@@ -223,8 +242,15 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None)
                                       decoder=decode_protocol22, runner=runner,
                                       query_timeout=min(config.query_timeout, 2.0),
                                       write_timeout=config.write_timeout)
+                queue_adapter = HerdrAdapter(config.session, command_builder=session_command(config.executable),
+                                             decoder=decode_protocol22, runner=runner,
+                                             query_timeout=min(config.query_timeout, 2.0),
+                                             write_timeout=config.write_timeout)
                 runtime = BridgeRuntime(core, config.bot_open_id, transport.send, runner,
-                                        output_reader=reader, send_output=transport.send_output_once)
+                                        output_reader=reader, send_output=transport.send_output_once,
+                                        queue_adapter=queue_adapter,
+                                        queue_interval=config.queue_interval,
+                                        queue_timeout=config.queue_timeout)
                 transport.is_stopping = lambda: runtime.stopping
                 with shutdown_signals(runtime):
                     try:
