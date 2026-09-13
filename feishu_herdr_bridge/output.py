@@ -159,7 +159,17 @@ def _devin_frame(lines: list[str]) -> _Frame | None:
             while j < n and (blank(transcript[j]) or _DEVIN_USER_CONT.match(transcript[j])):
                 j += 1
             end_i = tail(i + 1, j)
-            echo = "".join((transcript[i][1:] + "".join(transcript[i + 1:end_i])).split())
+            # Keep interior whitespace verbatim; only the ❭ marker and the
+            # two-space wrap gutter are UI chrome. A blank row is a real
+            # empty prompt line; \x00 marks a wrap boundary, which may stand
+            # for at most one swallowed space.
+            segments = [[transcript[i][1:].removeprefix(" ")]]
+            for row in transcript[i + 1:end_i]:
+                if _DEVIN_USER_CONT.match(row):
+                    segments[-1].append(row[2:])
+                elif blank(row):
+                    segments.extend(([""], []))
+            echo = "\n".join("\x00".join(seg) for seg in segments if seg)
             blocks.append(_Block("USER", i, end_i, echo))
         elif _DEVIN_TOOL_HEAD.match(line) or line.startswith(_DEVIN_TOOL_BODY):
             # A scrolled window may open inside a tool block, header off-screen.
@@ -241,33 +251,96 @@ def _frame(kind: str, raw: str) -> _Frame | None:
     return _Frame(normalized, tuple(blocks), lines[-1][6:])
 
 
+def _occurrences(rows: tuple[str, ...], anchor: tuple[str, ...]) -> int:
+    return sum(rows[i:i + len(anchor)] == anchor for i in range(len(rows) - len(anchor) + 1))
+
+
+def _overlap_boundary(old: tuple[str, ...], new: tuple[str, ...]) -> int | None:
+    """End offset in `new` of the baseline tail's unique reappearance.
+
+    The last rows of `old` must occur in `new` exactly once (and only once in
+    `old` itself) over a run of at least two nonblank rows: the shared tail
+    is the increment proof, so everything past it in `new` is post-baseline
+    content. Scroll offset is allowed; zero provable overlap cannot order
+    the two frames.
+    """
+    for k in range(min(len(old), len(new)), 0, -1):
+        run = old[len(old) - k:]
+        if (sum(row.startswith("| ") and bool(row[2:].strip()) for row in run) >= 2
+                and _occurrences(old, run) == 1 and _occurrences(new, run) == 1):
+            return next(i for i in range(len(new) - k + 1)
+                        if new[i:i + k] == run) + k
+    return None
+
+
+def _echo_match(echo: str, prompt: str) -> bool:
+    """A real echo is the prompt's lines, each possibly hard-wrapped onto
+    continuation rows. Segments keep real newlines verbatim; each wrap
+    boundary (\x00) may stand for at most one swallowed space — never
+    wholesale whitespace folding, so `alpha beta` and `alphabeta` echoed
+    on one row stay distinct."""
+    seg_sets: list[set[str]] = []
+    for segment in echo.split("\n"):
+        fragments = segment.split("\x00")
+        cands = {fragments[0]}
+        for fragment in fragments[1:]:
+            cands = {c + sep + fragment for c in cands for sep in ("", " ")}
+            if len(cands) > 64:
+                cands = {"".join(fragments)}
+                break
+        seg_sets.append(cands)
+    candidates = seg_sets[0]
+    for cands in seg_sets[1:]:
+        candidates = {c + "\n" + s for c in candidates for s in cands}
+        if len(candidates) > 256:
+            return prompt in candidates
+    return prompt in candidates
+
+
 def _extract(before: _Frame, after: _Frame, prompt: str) -> Extraction:
     if after.status not in {"idle", "done"}:
         return Extraction(None, "not_ready")
     if before.real is not after.real:
         return Extraction(None, "unrecognized")
-    if before.rows == after.rows:
+    old, new = before.rows, after.rows
+    if old == new:
         return Extraction(None, "unchanged")
-    # Real Devin echoes hard-wrap and reflow paragraphs; compare whitespace-free.
-    want = "".join(prompt.split()) if after.real else prompt
-    # The new user block is the increment proof itself: this prompt's echo must
-    # appear exactly once in the after frame and be absent from the baseline.
-    # Row-wise tail alignment is unreliable for a working baseline — in-flight
-    # tool rows mutate on completion (Running→Ran) and the window scrolls —
-    # so no transcript overlap is required.
+    # Real echoes hard-wrap; _echo_match replays the wrap without folding
+    # interior whitespace. Synthetic fixture blocks carry literal text.
+    matches = (lambda text: _echo_match(text, prompt)) if after.real \
+        else (lambda text: text == prompt)
+    # This prompt's echo must appear exactly once in the after frame and be
+    # absent from the baseline — that is the new user block.
     anchors = [block for block in after.blocks
-               if block.role == "USER" and block.text == want]
+               if block.role == "USER" and matches(block.text)]
     if not anchors:
         return Extraction(None, "waiting_for_prompt")
-    if len(anchors) != 1 or any(block.role == "USER" and block.text == want
+    if len(anchors) != 1 or any(block.role == "USER" and matches(block.text)
                               for block in before.blocks):
         return Extraction(None, "ambiguous_overlap")
+    # Row-level increment proof stays mandatory (§4.2 rule 2): the whole
+    # baseline as a prefix, or the baseline tail reappearing uniquely at any
+    # scroll offset. The echo must sit inside that proven-new region.
     anchor = anchors[0]
+    if new[:len(old)] == old:
+        boundary = len(old)
+    else:
+        boundary = _overlap_boundary(old, new)
+    if boundary is None or anchor.start < boundary:
+        return Extraction(None, "ambiguous_overlap")
     added = [block for block in after.blocks if block.start >= anchor.end]
     if any(block.role == "USER" for block in added):
         return Extraction(None, "ambiguous_prompt")
     if any(block.role == "APPROVAL" for block in added):
         return Extraction(None, "attention")
+    # Candidate rows must be genuinely new: a nonblank body row already
+    # visible in the baseline is old content resurfacing, not the answer.
+    old_rows = set(old)
+    for block in added:
+        if block.role == "ASSISTANT" and any(
+                row in old_rows for row in new[block.start:block.end]
+                if row.startswith("| ") and row[2:].strip()):
+            return Extraction(None, "ambiguous_overlap")
     body = "\n\n".join(block.text for block in added
                        if block.role == "ASSISTANT" and block.text.strip())
     if not body or body == prompt:

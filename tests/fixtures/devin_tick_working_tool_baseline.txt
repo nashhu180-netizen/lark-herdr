@@ -1,3 +1,6 @@
+# sampled 2026-09-13 ~13:5x UTC+8 · pane o24-review2 (w1V:p5) · frame f_14
+# cmd: herdr agent read w1V:p5 --source visible --lines 80 --format text
+# working baseline：P1 sleep 30 进行中工具块结尾，P2 仍在队列 · verbatim, 无脱敏需求（无路径/凭据）· sha256(pre-header)=c26fc510028752160323ce4c63564c98505244695d599b5e3b38d1972e1e9e11
  └ ✓ 5. round2-B9.md 追加增量复核节与最终结论
 
  B10 增量复核完成， round2-B9.md  已追加「增量复核 1511ea2」一节。

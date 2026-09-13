@@ -1,3 +1,6 @@
+# sampled 2026-09-13 ~13:5x UTC+8 · pane o24-review2 (w1V:p5) · frame f_20
+# cmd: herdr agent read w1V:p5 --source visible --lines 80 --format text
+# working 基线反例：转录已含 P2 回显（ queued 被拾取后） · verbatim, 无脱敏需求（无路径/凭据）· sha256(pre-header)=ffca13f647f93d1a50b77dff4c779307d59c70b463b29f4cd769d6ea33c0609a
    • 剔除被约束到可证明边界：header 须在转录首行或空行之后（ i == 0 or blank(transcript[i-1]) ）+ 续行封顶  _DEVIN_TIP_CONT_MAX=2
    + 续行须非空。真实语法中块首行均 0/1 空格，边界后紧贴的 ≥2 空格行只可能是 tip 续行——误吞路径封死。
    • 负例测试  test_did_you_know_boundary_never_eats_assistant_indents  三例恢复并加强 PR #23 精神。

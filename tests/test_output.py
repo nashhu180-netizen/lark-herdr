@@ -148,30 +148,41 @@ class ExtractionTests(unittest.TestCase):
         current = screen("devin", [FIXTURE["history"][-1], first["user"], first["assistant"]])
         self.assertEqual(out.extract_new_text("devin", before, current, first["prompt"]).body, first["expected"])
 
-    def test_scrolled_or_reordered_transcript_still_anchors_on_new_echo(self):
-        # Row-wise alignment between baseline and after is no longer required:
-        # the prompt's own user-block echo is the increment proof. Scrolled,
-        # truncated, or reordered history around it does not veto extraction.
+    def test_scrolled_tail_overlap_still_anchors_on_new_echo(self):
+        # Scroll offset is allowed: the baseline tail reappearing uniquely
+        # anywhere in the after frame is the row-level increment proof, and
+        # the echo anchor must sit inside that proven-new region.
         first = FIXTURE["rounds"][0]
-        anchor = FIXTURE["history"][-1]
-        tiny = {"role": "ASSISTANT", "lines": ["only one anchor line"]}
-        cases = [
-            (screen("devin", [anchor, anchor]), screen("devin", [anchor, first["user"], first["assistant"]])),
-            (screen("devin", [FIXTURE["history"][0], tiny]), screen("devin", [tiny, first["user"], first["assistant"]])),
-            (screen("devin", FIXTURE["history"]), screen("devin", [first["user"], first["assistant"]])),
-            (screen("devin", FIXTURE["history"]), screen("devin", list(reversed(FIXTURE["history"])) + [first["user"], first["assistant"]])),
-        ]
-        for before, current in cases:
-            with self.subTest(current=current):
-                self.assertEqual(out.extract_new_text("devin", before, current, first["prompt"]).body,
-                                 first["expected"])
+        before = screen("devin", FIXTURE["history"])
+        reordered = screen("devin", list(reversed(FIXTURE["history"]))
+                           + [first["user"], first["assistant"]])
+        self.assertEqual(out.extract_new_text("devin", before, reordered, first["prompt"]).body,
+                         first["expected"])
 
     def test_unprovable_or_duplicate_echo_fails_closed(self):
         first = FIXTURE["rounds"][0]
+        anchor = FIXTURE["history"][-1]
+        tiny = {"role": "ASSISTANT", "lines": ["only one anchor line"]}
+        fail_closed = [
+            # The baseline tail is not unique inside the baseline itself.
+            (screen("devin", [anchor, anchor]),
+             screen("devin", [anchor, first["user"], first["assistant"]])),
+            # Shared content below the contract's two-nonblank-row minimum.
+            (screen("devin", [FIXTURE["history"][0], tiny]),
+             screen("devin", [tiny, first["user"], first["assistant"]])),
+            # Zero overlap plus a matching echo: a historical same-text user
+            # block may simply have resurfaced; the frames cannot be ordered.
+            (screen("devin", FIXTURE["history"]),
+             screen("devin", [first["user"], first["assistant"]])),
+        ]
+        for before, current in fail_closed:
+            with self.subTest(current=current):
+                result = out.extract_new_text("devin", before, current, first["prompt"])
+                self.assertIsNone(result.body)
+                self.assertEqual(result.reason, "ambiguous_overlap")
         before = screen("devin", FIXTURE["history"])
         # No echo at all: the pane may not have rendered the prompt yet — wait.
-        cleared = screen("devin", [])
-        result = out.extract_new_text("devin", before, cleared, first["prompt"])
+        result = out.extract_new_text("devin", before, screen("devin", []), first["prompt"])
         self.assertIsNone(result.body)
         self.assertEqual(result.reason, "waiting_for_prompt")
         # The echo already in the baseline can never prove a newer round.
@@ -185,6 +196,28 @@ class ExtractionTests(unittest.TestCase):
         result = out.extract_new_text("devin", before, doubled, first["prompt"])
         self.assertIsNone(result.body)
         self.assertEqual(result.reason, "ambiguous_overlap")
+
+    def test_echo_match_preserves_interior_whitespace(self):
+        # Whitespace-folded matching let `❭ alphabeta` impersonate the prompt
+        # `alpha beta` (A-B12-002): fragments now join verbatim and a wrap
+        # boundary may stand for at most one swallowed space.
+        before = devin_screen(DEVIN_HISTORY)
+        for prompt, echoed in (("alpha beta", "alphabeta"),
+                               ("alphabeta", "alpha beta"),
+                               ("alpha  beta", "alpha beta"),
+                               ("alpha beta", "alpha  beta")):
+            after = devin_screen(DEVIN_HISTORY + ["", "❭ " + echoed, "", " WRONG_BODY"])
+            with self.subTest(prompt=prompt, echoed=echoed):
+                result = out.extract_new_text("devin", before, after, prompt)
+                self.assertIsNone(result.body)
+                self.assertEqual(result.reason, "waiting_for_prompt")
+        # A genuinely wrapped echo still matches: each boundary may carry at
+        # most one space consumed by the wrap.
+        wrapped = devin_screen(DEVIN_HISTORY + ["", "❭ alpha", "  beta", "", " RIGHT_BODY"])
+        self.assertEqual(out.extract_new_text("devin", before, wrapped, "alpha beta").body,
+                         "RIGHT_BODY")
+        self.assertEqual(out.extract_new_text("devin", before, wrapped, "alphabeta").body,
+                         "RIGHT_BODY")
 
     def test_crlf_and_known_padding_normalization_preserve_inner_unicode_spacing(self):
         first = FIXTURE["rounds"][0]
@@ -313,7 +346,12 @@ class RealDevinExtractionTests(unittest.TestCase):
 
     @staticmethod
     def _live_fixture(name):
-        return (Path(__file__).parent / "fixtures" / name).read_text(encoding="utf-8")
+        # Live fixtures may carry a leading `#` provenance header (pane,
+        # timestamp, read command, digest); the frame below stays verbatim.
+        lines = (Path(__file__).parent / "fixtures" / name).read_text(encoding="utf-8").split("\n")
+        while lines and lines[0].startswith("#"):
+            lines.pop(0)
+        return "\n".join(lines)
 
     def test_real_frames_verbatim_reply_declines_echo_only(self):
         # Issue #24 F-004/F-005: the live deadline traced to a Devin reply

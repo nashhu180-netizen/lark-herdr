@@ -1,3 +1,6 @@
+# sampled 2026-09-13 ~13:5x UTC+8 · pane o24-review2 (w1V:p5) · frame f_21
+# cmd: herdr agent read w1V:p5 --source visible --lines 80 --format text
+# idle after：P1 工具块展开 + P2 回显 + PONG-F 回复 · verbatim, 无脱敏需求（无路径/凭据）· sha256(pre-header)=2fa999db26be36b792dc5b8108058c6d97eb76cb70662aabf96e3d4233beb4a3
    • 负例测试  test_did_you_know_boundary_never_eats_assistant_indents  三例恢复并加强 PR #23 精神。
 
  派发实证（o30 .venv 直测  extract_new_text ）：
