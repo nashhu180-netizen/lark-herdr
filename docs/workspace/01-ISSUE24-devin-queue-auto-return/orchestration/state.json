@@ -1,0 +1,28 @@
+{
+  "current_batch": "B2",
+  "batches": {
+    "B1": {
+      "status": "done",
+      "note": "capture→None 路径钉死；撕裂假设最简且被 PR #25 覆盖，但离线不能排除持续性未识别帧形态或 get/read 边界异常两类不覆盖根因（findings F-001）"
+    },
+    "B2": {
+      "status": "dispatched",
+      "note": "fix+tests"
+    },
+    "B3": {
+      "status": "pending",
+      "note": "audit"
+    },
+    "B4": {
+      "status": "pending",
+      "note": "fresh review"
+    },
+    "B5": {
+      "status": "pending",
+      "note": "deploy+live validation (user authorized)"
+    }
+  },
+  "last_change": "B2 dispatched (D-001=b)",
+  "task": "ISSUE24",
+  "heartbeat": "2026-09-13 round23: exec working on B2 (writing findings.md)"
+}

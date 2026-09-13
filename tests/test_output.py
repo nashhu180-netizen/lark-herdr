@@ -1013,6 +1013,306 @@ class ObserverTests(unittest.TestCase):
         self.assertIsNone(r.observer.capture(origin, "task"))
         self.assertEqual([call[0] for call in r.calls], ["get", "read", "read"])
 
+    def test_issue24_second_prompt_during_working_turn_arms(self):
+        # Issue #24 modeled scenario on sanitized synthetic fixtures (no live
+        # frame was captured): P1 armed while the pane was idle, the pane went
+        # working, then P2 cancelled W1 and its own capture declined ->
+        # "本次自动回传未启用". Under the lock a new prompt cancels the previous
+        # watch and then captures a baseline from the current working frame;
+        # the second prompt must still arm.
+        from dataclasses import replace
+        P1, P2 = "sleep 20", "then answer with P2_LIVE_OK"
+        work = ["", "❭ " + P1, "", " ○ Running command", " │ $ sleep 20",
+                " │ Timeout: 0ms"]
+        r = Rig()
+        origin1 = r.origin(message="m1")
+        r.screens[origin1.pane_id] = devin_screen(DEVIN_HISTORY)
+        watch1 = r.arm(origin1, P1)
+        self.assertIsNotNone(watch1)
+        r.states[origin1.pane_id] = replace(
+            r.states[origin1.pane_id], status="working")
+        # Working chrome shaped as the Issue #24 /read diagnostic described:
+        # Running tools spinner, bypass rule, "Guide Devin while it works"
+        # input, status and activity rows.
+        r.screens[origin1.pane_id] = devin_screen(
+            DEVIN_HISTORY + work, status="working",
+            spinner="⠐⠒ Running tools · 12s (esc twice to interrupt)",
+            input_text="Guide Devin while it works",
+            activity="10 subagents · ↓ select")
+        origin2 = r.origin(message="m2")
+        # Same order as core._capture_output: cancel the old watch, then
+        # capture the baseline for the new prompt.
+        r.observer.cancel_current(origin2.chat_id)
+        self.assertEqual((watch1.phase, watch1.reason), ("closed", "cancelled"))
+        watch2 = r.observer.capture(origin2, P2)
+        r.phases[origin2] = "submitted"
+        self.assertIsNotNone(watch2)
+        self.assertTrue(r.observer.arm(watch2))
+
+    def test_working_capture_variants(self):
+        # Parser/timing regressions around a working-pane second capture.
+        # The queue and torn frames are synthetic hypothesis shapes: they are
+        # not captured live frames, and a queued display cannot hold the new
+        # prompt at capture time because capture precedes prompt submission.
+        from dataclasses import replace
+        P1, P2 = "sleep 20", "then answer with P2_LIVE_OK"
+        work = ["", "❭ " + P1, "", " ○ Running command", " │ $ sleep 20",
+                " │ Timeout: 0ms"]
+        queued = devin_queued_screen(
+            DEVIN_HISTORY + ["", " ○ Running command", " │ $ prior task",
+                             " │ still running"],
+            P1, activity="10 subagents · ↓ select")
+        queued_new = devin_queued_screen(
+            DEVIN_HISTORY + work, P2, activity="10 subagents · ↓ select")
+        # Synthetic hypothesis only: queue rule drawn but queued row not yet
+        # repainted (a mid-redraw shape; no live capture proves it occurred).
+        torn_queue = "\n".join(
+            DEVIN_HISTORY + ["", "⠸ Running tools · 0m 12s (esc to interrupt · enter sends queued)",
+                             "── 1 queued " + "─" * 20 + " ↑ edit · ↵ send now ──",
+                             DEVIN_RULE_TOP,
+                             "❭ Press Enter to send queued messages now",
+                             DEVIN_RULE_BOTTOM, DEVIN_STATUS]) + "\n"
+
+        def rig_with_first_watch():
+            r = Rig()
+            origin1 = r.origin(message="m1")
+            r.screens[origin1.pane_id] = devin_screen(DEVIN_HISTORY)
+            watch1 = r.arm(origin1, P1)
+            assert watch1 is not None
+            assert watch1.phase == "watching" and watch1._prompt == P1
+            r.states[origin1.pane_id] = replace(
+                r.states[origin1.pane_id], status="working")
+            origin2 = r.origin(message="m2")
+            r.observer.cancel_current(origin2.chat_id)
+            # A cancelled watching watch is fully detached: no _active residue.
+            assert (watch1.phase, watch1.reason) == ("closed", "cancelled")
+            assert r.observer._active.get(origin2.chat_id) is None
+            return r, origin1, watch1, origin2
+
+        # Sampled queue chrome parses to a working baseline; whether the
+        # queued row carries the prior or the new prompt is a parser-only
+        # regression, since the new prompt cannot be queued at capture time.
+        for label, frame in (("queue_chrome_prior_prompt", queued),
+                             ("queue_chrome_new_prompt", queued_new)):
+            with self.subTest(variant=label):
+                r, origin1, watch1, origin2 = rig_with_first_watch()
+                r.screens[origin1.pane_id] = frame
+                watch2 = r.observer.capture(origin2, P2)
+                r.phases[origin2] = "submitted"
+                self.assertIsNotNone(watch2)
+                self.assertTrue(r.observer.arm(watch2))
+        # Synthetic hypothesis (a): a torn first baseline read recovers on the
+        # second read, which is the failure shape PR #25 retries.
+        with self.subTest(variant="torn_then_queued_frame"):
+            r, origin1, watch1, origin2 = rig_with_first_watch()
+            samples = iter([torn_queue, queued])
+            r.on_read = lambda pane: r.screens.__setitem__(pane, next(samples))
+            before = len(r.calls)
+            watch2 = r.observer.capture(origin2, P2)
+            r.phases[origin2] = "submitted"
+            self.assertIsNotNone(watch2)
+            self.assertTrue(r.observer.arm(watch2))
+            self.assertEqual([call[0] for call in r.calls[before:]],
+                             ["get", "read", "read"])
+        with self.subTest(variant="torn_twice_during_queue_redraw"):
+            r, origin1, watch1, origin2 = rig_with_first_watch()
+            r.screens[origin1.pane_id] = torn_queue
+            before = len(r.calls)
+            self.assertIsNone(r.observer.capture(origin2, P2))
+            self.assertEqual([call[0] for call in r.calls[before:]],
+                             ["get", "read", "read"])
+            self.assertIn(("capture", 1, "declined", "frame_unparsed"), r.logs)
+        # The sampled queue chrome whitelists exactly "1 queued"; two queued
+        # entries (e.g. the prior prompt plus a line typed in the pane) draw a
+        # different rule row which fails closed on both baseline reads.
+        with self.subTest(variant="two_queued_rows"):
+            r, origin1, watch1, origin2 = rig_with_first_watch()
+            r.screens[origin1.pane_id] = queued.replace(
+                "── 1 queued ", "── 2 queued ", 1)
+            before = len(r.calls)
+            self.assertIsNone(r.observer.capture(origin2, P2))
+            self.assertEqual([call[0] for call in r.calls[before:]],
+                             ["get", "read", "read"])
+            self.assertIn(("capture", 1, "declined", "frame_unparsed"), r.logs)
+        # (b) A watching watch carrying its prompt leaves no _active residue
+        # after cancellation; the next capture is unaffected by it.
+        with self.subTest(variant="cancelled_watch_leaves_no_residue"):
+            r, origin1, watch1, origin2 = rig_with_first_watch()
+            r.screens[origin1.pane_id] = queued
+            watch2 = r.observer.capture(origin2, P2)
+            r.phases[origin2] = "submitted"
+            self.assertIsNotNone(watch2)
+            self.assertTrue(r.observer.arm(watch2))
+        # (c) A second prompt sharing the first prompt's prefix still arms;
+        # echo attribution is checked later at tick time, not at capture.
+        with self.subTest(variant="shared_prefix_prompt"):
+            r, origin1, watch1, origin2 = rig_with_first_watch()
+            r.screens[origin1.pane_id] = queued
+            watch2 = r.observer.capture(origin2, P1 + " more")
+            r.phases[origin2] = "submitted"
+            self.assertIsNotNone(watch2)
+            self.assertTrue(r.observer.arm(watch2))
+        # A baseline read that fails outright (e.g. the bounded read times out
+        # against a busy pane) is not retried: the retry only covers frames
+        # that parse to nothing, not raised boundary errors.
+        with self.subTest(variant="read_raises"):
+            r, origin1, watch1, origin2 = rig_with_first_watch()
+            def boom(_):
+                raise RuntimeError("read boundary")
+            r.on_read = boom
+            before = len(r.calls)
+            self.assertIsNone(r.observer.capture(origin2, P2))
+            self.assertEqual([call[0] for call in r.calls[before:]],
+                             ["get", "read"])
+            self.assertIn(("capture", 1, "declined", "read_failed"), r.logs)
+
+    def test_capture_declines_emit_fixed_reason_codes(self):
+        # Every capture() return-None exit emits exactly one declined audit
+        # event carrying a fixed machine code; no content is logged.
+        from dataclasses import replace
+        PROMPT = FIXTURE["rounds"][0]["prompt"]
+
+        def declined(r):
+            return [entry[3] for entry in r.logs if entry[2] == "declined"]
+
+        def expect(r, code):
+            self.assertEqual(declined(r), [code])
+
+        with self.subTest(exit="invalid_origin"):
+            r = Rig()
+            origin = r.origin()
+            self.assertIsNone(r.observer.capture(replace(origin, kind="other"), "task"))
+            expect(r, "invalid_origin")
+            self.assertEqual(r.calls, [])
+        with self.subTest(exit="not_allowed_entry"):
+            r = Rig()
+            origin = r.origin()
+            r.phases[origin] = "unknown"
+            self.assertIsNone(r.observer.capture(origin, "task"))
+            expect(r, "not_allowed")
+            self.assertEqual(r.calls, [])
+        with self.subTest(exit="same_message"):
+            r = Rig()
+            origin = r.origin()
+            self.assertIsNotNone(r.observer.capture(origin, PROMPT))
+            self.assertIsNone(r.observer.capture(origin, PROMPT))
+            expect(r, "same_message")
+        with self.subTest(exit="capacity"):
+            r = Rig()
+            for i in range(out.CAPACITY):
+                r.arm(r.origin(f"m-{i}", f"chat-{i}", f"pane-{i}", f"workspace-{i}"))
+            extra = r.origin("extra", "chat-extra", "pane-extra", "workspace-extra")
+            before = len(r.calls)
+            self.assertIsNone(r.observer.capture(extra, "task"))
+            expect(r, "capacity")
+            self.assertEqual(len(r.calls), before)
+        with self.subTest(exit="prompt_invalid"):
+            r = Rig()
+            origin = r.origin()
+            self.assertIsNone(r.observer.capture(origin, "  \x00  "))
+            expect(r, "prompt_invalid")
+            self.assertEqual(r.calls, [])
+        with self.subTest(exit="get_failed"):
+            r = Rig()
+            origin = r.origin()
+            def boom(_):
+                raise RuntimeError("get boundary")
+            r.on_get = boom
+            self.assertIsNone(r.observer.capture(origin, "task"))
+            expect(r, "get_failed")
+            self.assertEqual(r.calls, [("get", origin.pane_id)])
+        with self.subTest(exit="kind_mismatch"):
+            r = Rig()
+            origin = r.origin()
+            r.states[origin.pane_id] = replace(r.states[origin.pane_id], kind="claude")
+            self.assertIsNone(r.observer.capture(origin, "task"))
+            expect(r, "kind_mismatch")
+            self.assertEqual(r.calls, [("get", origin.pane_id)])
+        for status in ("blocked", "unknown"):
+            with self.subTest(exit="status_other", status=status):
+                r = Rig()
+                origin = r.origin()
+                r.states[origin.pane_id] = replace(r.states[origin.pane_id], status=status)
+                self.assertIsNone(r.observer.capture(origin, "task"))
+                expect(r, "status_other")
+                self.assertEqual(r.calls, [("get", origin.pane_id)])
+        with self.subTest(exit="not_allowed_after_get"):
+            r = Rig()
+            origin = r.origin()
+            r.on_get = lambda pane: r.phases.__setitem__(origin, "other")
+            self.assertIsNone(r.observer.capture(origin, "task"))
+            expect(r, "not_allowed")
+            self.assertEqual(r.calls, [("get", origin.pane_id)])
+        with self.subTest(exit="read_failed"):
+            r = Rig()
+            origin = r.origin()
+            def boom(_):
+                raise RuntimeError("read boundary")
+            r.on_read = boom
+            self.assertIsNone(r.observer.capture(origin, "task"))
+            expect(r, "read_failed")
+            self.assertEqual(r.calls, [("get", origin.pane_id), ("read", origin.pane_id)])
+        with self.subTest(exit="not_allowed_inside_loop"):
+            r = Rig()
+            origin = r.origin()
+            r.screens[origin.pane_id] = "unparseable"
+            r.on_read = lambda pane: r.phases.__setitem__(origin, "other")
+            self.assertIsNone(r.observer.capture(origin, "task"))
+            expect(r, "not_allowed")
+            self.assertEqual(r.calls, [("get", origin.pane_id), ("read", origin.pane_id)])
+        with self.subTest(exit="frame_unparsed_idle"):
+            r = Rig()
+            origin = r.origin()
+            r.screens[origin.pane_id] = "unparseable"
+            self.assertIsNone(r.observer.capture(origin, "task"))
+            expect(r, "frame_unparsed")
+            self.assertEqual(r.calls, [("get", origin.pane_id), ("read", origin.pane_id)])
+        with self.subTest(exit="frame_unparsed_devin_working_two_reads"):
+            r = Rig()
+            origin = r.origin()
+            r.states[origin.pane_id] = replace(r.states[origin.pane_id], status="working")
+            r.screens[origin.pane_id] = "unparseable"
+            self.assertIsNone(r.observer.capture(origin, "task"))
+            expect(r, "frame_unparsed")
+            self.assertEqual(r.calls, [("get", origin.pane_id)] + [("read", origin.pane_id)] * 2)
+        for status in ("blocked", "unknown"):
+            with self.subTest(exit="frame_status_other", status=status):
+                r = Rig()
+                origin = r.origin()
+                r.screens[origin.pane_id] = screen(origin.kind, FIXTURE["history"], status)
+                self.assertIsNone(r.observer.capture(origin, "task"))
+                expect(r, "frame_status_other")
+                self.assertEqual(r.calls, [("get", origin.pane_id), ("read", origin.pane_id)])
+        with self.subTest(exit="not_allowed_after_loop"):
+            r = Rig()
+            origin = r.origin()
+            r.on_read = lambda pane: r.phases.__setitem__(origin, "other")
+            self.assertIsNone(r.observer.capture(origin, "task"))
+            expect(r, "not_allowed")
+            self.assertEqual(r.calls, [("get", origin.pane_id), ("read", origin.pane_id)])
+        with self.subTest(exit="error"):
+            r = Rig()
+            origin = r.origin()
+            r.states[origin.pane_id] = object()
+            self.assertIsNone(r.observer.capture(origin, "task"))
+            expect(r, "error")
+            self.assertEqual(r.calls, [("get", origin.pane_id)])
+
+    def test_capture_decline_audit_failure_never_changes_outcome(self):
+        # A broken audit sink must not change capture/arm/prompt behavior.
+        r = self.rig
+        origin = r.origin()
+        def bad_audit(*_):
+            raise RuntimeError("PRIVATE")
+        r.observer._audit = bad_audit
+        r.phases[origin] = "other"
+        self.assertIsNone(r.observer.capture(origin, "task"))
+        r.phases[origin] = "processing"
+        watch = r.observer.capture(origin, FIXTURE["rounds"][0]["prompt"])
+        self.assertIsNotNone(watch)
+        r.phases[origin] = "submitted"
+        self.assertTrue(r.observer.arm(watch))
+
     def test_guard_revocation_before_read_during_read_and_before_send_discards(self):
         for point in ("before_get", "during_get", "during_read", "attempted"):
             with self.subTest(point=point):
@@ -1179,6 +1479,7 @@ class ObserverTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs):
                 self.assertIsNone(r.observer.capture(replace(origin, **kwargs), "task"))
         self.assertEqual(r.calls, [])
+        self.assertEqual([entry[3] for entry in r.logs], ["invalid_origin"] * 6)
 
     def test_long_read_crossing_deadline_cannot_emit_a_body(self):
         r = self.rig

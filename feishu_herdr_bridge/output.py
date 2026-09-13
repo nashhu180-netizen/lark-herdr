@@ -397,6 +397,16 @@ class OutputObserver:
             except Exception:
                 pass  # Never leak exception text or retry an operation to log it.
 
+    def _decline(self, origin: Origin, reason: str) -> None:
+        """One fixed-code audit event per refused capture; the refusal never changes."""
+        try:
+            revision = (origin.revision if isinstance(origin, Origin)
+                        and type(origin.revision) is int else 0)
+            if self._audit is not None:
+                self._audit("capture", revision, "declined", reason)
+        except Exception:
+            pass  # Never leak exception text or retry an operation to log it.
+
     def _close(self, watch: Observation, reason: str) -> None:
         if self._active.get(watch.origin.chat_id) is watch:
             del self._active[watch.origin.chat_id]
@@ -430,33 +440,50 @@ class OutputObserver:
 
     def capture(self, origin: Origin, prompt: str) -> Observation | None:
         """Best effort only: failure must not change whether the prompt is sent."""
-        if not self._valid(origin) or not self._allowed(origin, "processing"):
-            return None
+        if not self._valid(origin):
+            return self._decline(origin, "invalid_origin")
+        if not self._allowed(origin, "processing"):
+            return self._decline(origin, "not_allowed")
         old = self._active.get(origin.chat_id)
         if old is not None and old.origin.message_id == origin.message_id:
-            return None
+            return self._decline(origin, "same_message")
         self.cancel_current(origin.chat_id)
         expected = _prompt(prompt)
-        if len(self._active) >= CAPACITY or expected is None:
-            return None
+        if len(self._active) >= CAPACITY:
+            return self._decline(origin, "capacity")
+        if expected is None:
+            return self._decline(origin, "prompt_invalid")
         try:
             state = self._get(origin.pane_id)
-            if (not self._matches(origin, state) or state.status not in {"idle", "done", "working"}
-                    or not self._allowed(origin, "processing")):
-                return None
+        except Exception:
+            return self._decline(origin, "get_failed")
+        try:
+            if not self._matches(origin, state):
+                return self._decline(origin, "kind_mismatch")
+            if state.status not in {"idle", "done", "working"}:
+                return self._decline(origin, "status_other")
+            if not self._allowed(origin, "processing"):
+                return self._decline(origin, "not_allowed")
             before = None
             attempts = 2 if origin.kind == "devin" and state.status == "working" else 1
             for _ in range(attempts):
-                before = _frame(origin.kind, self._read(origin.pane_id))
+                try:
+                    raw = self._read(origin.pane_id)
+                except Exception:
+                    return self._decline(origin, "read_failed")
+                before = _frame(origin.kind, raw)
                 if before is not None and before.status in {"idle", "done", "working"}:
                     break
                 if not self._allowed(origin, "processing"):
-                    return None
-            if (before is None or before.status not in {"idle", "done", "working"}
-                    or not self._allowed(origin, "processing")):
-                return None
+                    return self._decline(origin, "not_allowed")
+            if before is None:
+                return self._decline(origin, "frame_unparsed")
+            if before.status not in {"idle", "done", "working"}:
+                return self._decline(origin, "frame_status_other")
+            if not self._allowed(origin, "processing"):
+                return self._decline(origin, "not_allowed")
         except Exception:
-            return None
+            return self._decline(origin, "error")
         watch = Observation(origin, _baseline=before, _prompt=expected)
         self._active[origin.chat_id] = watch
         return watch
@@ -642,8 +669,11 @@ def connect_output(core, reader, send, *, clock=time.monotonic, stopping=lambda:
             core.store.invalidate(binding)  # Existing conditional UPDATE protects newer revisions.
 
     def audit(ref, revision, event, reason):
-        logging.getLogger(__name__).info("output watch=%s revision=%s event=%s reason=%s",
-                                        ref, revision, event, reason)
+        if ref == "capture":  # No watch exists yet; fixed codes only, no values.
+            logging.getLogger(__name__).info("output capture=%s reason=%s", event, reason)
+        else:
+            logging.getLogger(__name__).info("output watch=%s revision=%s event=%s reason=%s",
+                                            ref, revision, event, reason)
 
     observer = OutputObserver(current=current, request_phase=request_phase, get=reader.get_agent,
                               read=reader.read_agent, send=send, invalidate=invalidate,
