@@ -55,3 +55,19 @@
 本次真实失败点是 Claude 首次启动被客户端首次运行界面阻塞，桥接按未知远端结果保留资源、不换绑、不重试；人工处理客户端后可恢复。这符合安全边界，但属于需要运维手册明确说明的体验限制。
 
 仍未覆盖：私聊、非白名单和非文本输入、未知命令、恶意字符、重复投递与回执失败、确认过期/跨用户/取消、名称碰撞、Agent 退出或目标删除、执行中停机、真实双开、移动网络/锁屏/linger，以及 SDK 断线重连。结论仅为“核心 MVP 真实冒烟通过”，不是完整破坏性矩阵通过。
+
+---
+
+## 2026-09-13 Issue #24 目标场景验收（Devin pane 忙时排队、空闲后自动回传）
+
+- **日期**：2026-09-13 16:39（此前 16:35 有一轮干扰失败，见备注）
+- **commit**：`780db5a`（main，含 PR #35 `fix/send-wait-idle`，已部署运行）
+- **场景**：真实飞书群绑定 Devin pane（`w15:p1K`，binding rev3）。先发送 `sleep 25`，紧接发送"收到后只回复 PONG-M 这六个字符"——即 Issue #24 的目标场景：pane working 期间到达的第二条群提示。
+- **日志时间线**（桥日志，真实部署进程）：
+  - `16:39:09` `send-queue enqueued reason=busy`——第二条消息在 pane working 期间到达，进入 per-pane FIFO，未立即发送
+  - `edge observed`——in-flight 边沿闸观察到 pane 进入 non-idle（B14 rework1 的串行保证生效）
+  - `16:39:35` `closed reason=submitted` + `watch armed`——pane 回到空闲后排队消息才真实发出，延迟 capture 在空闲点取到基线并 arm
+  - `16:39:44` `attempted reason=body` → `closed reason=sent`——自动回传发出，飞书群收到「主控 Pane w15:p1K PONG-M」
+  - SQLite `requests` 表：两条 prompt 记录均 `done/submitted`
+- **结论**：**通过**。Issue #24 目标场景端到端打通——忙时到达的群提示不再在工作中画面上截基线，而是排队至 pane 可证空闲后发送，`PONG-M` 自动回传成功。
+- **备注**：前一轮 16:35 的 `capture=declined reason=frame_unparsed` 系该 pane 被另一编排（`w15:p1`）插话打断、画面处于 Canceled 过渡态所致，非桥缺陷，本轮已排除。
