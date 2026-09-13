@@ -1,0 +1,28 @@
+{
+  "current_batch": "B3",
+  "batches": {
+    "B1": {
+      "status": "done",
+      "note": "capture→None 路径钉死；根因为非穷尽候选集（已排除/有旁证未排除/未知三栏），不能在候选间排序（findings F-001，audit-B1 整改后口径）"
+    },
+    "B2": {
+      "status": "done",
+      "note": "fix+tests: PR#25 保留 + capture 拒绝出口固定码审计 output capture=declined；audit-B1 三条整改并入"
+    },
+    "B3": {
+      "status": "dispatched",
+      "note": "audit"
+    },
+    "B4": {
+      "status": "pending",
+      "note": "fresh review"
+    },
+    "B5": {
+      "status": "pending",
+      "note": "deploy+live validation (user authorized)"
+    }
+  },
+  "last_change": "B3 audit-B2 dispatched",
+  "task": "ISSUE24",
+  "heartbeat": "2026-09-13 round29: exec working on B3 fix"
+}
