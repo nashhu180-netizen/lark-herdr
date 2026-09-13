@@ -232,6 +232,22 @@ class RealDevinExtractionTests(unittest.TestCase):
             "P1_LIVE_OK",
         )
 
+    def test_tip_header_at_boundary_drops_following_indent_line(self):
+        # Semantic change per decisions D-004 (structure rule wins): the old
+        # PR #23 near-match input — exact header at a UI boundary followed by
+        # one arbitrary indented line — is a provable tip block and the whole
+        # block is dropped now. The old "arbitrary text stays" guarantee is
+        # carried by the three boundary counterexamples below instead.
+        before = devin_screen(DEVIN_HISTORY)
+        near_match = self.round(
+            " P1_LIVE_OK", "", " ✱ Did you know",
+            "   Arbitrary assistant text must remain visible",
+        )
+        self.assertEqual(
+            out.extract_new_text("devin", before, near_match, self.PROMPT).body,
+            "P1_LIVE_OK",
+        )
+
     def test_did_you_know_boundary_never_eats_assistant_indents(self):
         # Negative coverage restored (PR #23 near-match spirit): only a tip
         # at a provable UI boundary — exact header at frame start or after a
