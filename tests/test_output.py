@@ -232,6 +232,39 @@ class RealDevinExtractionTests(unittest.TestCase):
             "P1_LIVE_OK",
         )
 
+    def test_did_you_know_boundary_never_eats_assistant_indents(self):
+        # Negative coverage restored (PR #23 near-match spirit): only a tip
+        # at a provable UI boundary — exact header at frame start or after a
+        # blank row, plus at most two indented continuations — is dropped.
+        before = devin_screen(DEVIN_HISTORY)
+        # (1) Header with a non-blank previous row is not a tip block: the
+        # header and the indented line under it are assistant body.
+        mid_body = self.round(
+            " P1_LIVE_OK", " ✱ Did you know", "   still assistant body",
+        )
+        body = out.extract_new_text("devin", before, mid_body, self.PROMPT).body
+        self.assertIn("Did you know", body)
+        self.assertIn("still assistant body", body)
+        # (2) A tip block eats at most two continuation lines; a longer
+        # indented run keeps the remainder.
+        over = self.round(
+            " P1_LIVE_OK", "", " ✱ Did you know",
+            "   cont one", "   cont two", "   KEEP_THREE", "   KEEP_FOUR",
+        )
+        body = out.extract_new_text("devin", before, over, self.PROMPT).body
+        self.assertNotIn("cont one", body)
+        self.assertNotIn("cont two", body)
+        self.assertIn("KEEP_THREE", body)
+        self.assertIn("KEEP_FOUR", body)
+        # (3) Indented assistant body with no tip header is untouched.
+        plain = self.round(
+            " P1_LIVE_OK", "   indent a", "   indent b", "   indent c",
+        )
+        body = out.extract_new_text("devin", before, plain, self.PROMPT).body
+        self.assertIn("indent a", body)
+        self.assertIn("indent b", body)
+        self.assertIn("indent c", body)
+
     @staticmethod
     def _live_fixture(name):
         return (Path(__file__).parent / "fixtures" / name).read_text(encoding="utf-8")
