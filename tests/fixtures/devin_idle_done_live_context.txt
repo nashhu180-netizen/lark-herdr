@@ -1,0 +1,44 @@
+   •  capture()  重构逐出口与原版等价：守卫顺序不变，15 个 None 出口各发恰好一个固定码（12 码闭集）， not_allowed  复用 4 个守卫时
+   点属同一语义组。
+   • 行为差异全部 fail-closed 或合同内：devin+working 至多两读（无 sleep/轮询，read 异常即  read_failed  不重试）；坏帧路径多一次
+   _allowed  复查（更保守）；audit 汇故障不改变结果。
+   • 日志最小化达标：capture 分支只出  output capture=declined reason=<码> ，无 revision/画面/提示/异常文本。
+   • 红线核验：无按键/重放/通用 diff/直转/守卫放宽。
+
+ 审核收敛：A-B1-001/002/003、A-B2-001/002 五条全部收敛（逐条证据在报告 §二）。
+
+ 独立重跑： unittest discover  → 302 tests OK（41.7s）； compileall  → 干净； git diff --check  三级（工作区 /  83c4302..HEAD  /  m
+ ain...HEAD ）→ 全干净。
+
+ 变异验证（ output.py  sha256 基线  e5fe6442…af03 ）：
+
+   • M1  attempts  2→1 → 施加态  50df978d…2af0 ，5 处红（重试 arm + 两读计数断言）→ 还原回基线 hash；
+   • M2  read_failed  出口去日志 → 施加态  ba5c10cc…2e0a ，2 处红 → 还原回基线 hash。
+
+ 遗留说明（不阻断，见报告 §五）：根因按 D-002 口径为假设 (i) 修复 + 取证日志，非已确认根因；D-003 原生队列 Enter 问题为用户级未决
+ 项；PR 内含 ~580 行编排文档（允许路径内，合入策略由主控定）。
+
+ 工作区已净：生产/测试文件零残留改动，仅新增  round2.md （主控的 state.json/progress.md WIP 未动）。
+
+ ✱ Did you know
+   Press Ctrl+L to clear the screen, Ctrl+Shift+L to redraw
+
+❭ 请只执行 sleep 30 这一条命令，不要做别的
+
+ ⏺ Read shell 9ae6de
+ │ Timeout: 30s
+ └ Session: 9ae6de
+
+ ⏺ Ran command
+ │ $ sleep 30
+ │ Timeout: 45s
+ │ Exited with code 0 and no output
+ │ Exit code: 0
+ └ Exited with code 0
+
+  sleep 30  已执行完毕（exit 0）。
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────── (bypass permissions on) ─
+❭ Ask Devin to build features, fix bugs, or work on your code
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+SWE-2 Max                                                                                          Context: 77k / 262k tokens (29%)

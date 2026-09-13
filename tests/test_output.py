@@ -1185,6 +1185,32 @@ class ObserverTests(unittest.TestCase):
                 self.assertEqual(frame.status, "working")
                 self.assertTrue(frame.real)
 
+    def test_devin_status_bar_tail_variants_parse(self):
+        # The Devin status bar cycles between several tails. Two further
+        # verbatim tails were sighted on our own panes but not re-captured in
+        # this sampling window, so they are asserted by swapping the last row
+        # of a real sampled idle/done frame (fixture below) — labelled splice,
+        # not a live capture. An unrecognized tail must still fail closed:
+        # an idle/done "after" frame that fails to parse can never emit the
+        # final response body.
+        sampled = (Path(__file__).parent / "fixtures"
+                   / "devin_idle_done_live_context.txt").read_text(encoding="utf-8")
+        frame = out._frame("devin", sampled)
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame.status, "idle")
+        lines = sampled.rstrip("\n").split("\n")
+        head = "\n".join(lines[:-1]) + "\n"
+        for tail in ("SWE-2 Medium" + " " * 24 + "See usage and cost: /session-stats",
+                     "SWE-2 Max" + " " * 24 + "Press Ctrl+L to clear the screen, "
+                                              "Ctrl+Shift+L to redraw"):
+            with self.subTest(tail=tail[-45:]):
+                spliced = out._frame("devin", head + tail + "\n")
+                self.assertIsNotNone(spliced)
+                self.assertEqual(spliced.status, "idle")
+        with self.subTest(tail="unrecognized-still-fails-closed"):
+            self.assertIsNone(out._frame(
+                "devin", head + "SWE-2 Max" + " " * 24 + "Some other tail\n"))
+
     def test_working_capture_arms_on_real_alt_hint_frame(self):
         # The sampled alt-hint frame is the shape that declined live with
         # frame_unparsed; as a working baseline it must arm on the first read
