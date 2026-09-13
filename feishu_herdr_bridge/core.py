@@ -1,13 +1,19 @@
-"""Synchronous offline routing core. No SDK, queue, or background task loop."""
+"""Synchronous offline routing core plus a poll-driven per-pane send queue.
+
+No SDK or self-owned background task loop: the runtime drives SendQueue.poll
+from its own thread, exactly like the output observer's tick.
+"""
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import re
 import secrets
 import threading
 import time
+from collections import deque
 from _thread import LockType
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -64,6 +70,316 @@ class GroupCreateResult:
     verified: bool = False
 
 
+@dataclass(frozen=True, repr=False)
+class QueuedPrompt:
+    message: Message
+    binding: Binding
+    kind: str
+    enqueued_at: float
+
+
+_QUEUE_IDLE = {"idle", "done"}
+QUEUE_INTERVAL = 2.0
+QUEUE_TIMEOUT = 600.0
+QUEUE_EDGE_CAP = 15.0
+
+
+class SendQueue:
+    """Per-pane in-memory FIFO for prompts that arrive while a pane is busy.
+
+    An entry's request row stays 'processing' until it is sent or dropped, so
+    capture/arm reuse the unchanged request-phase guards and a restart settles
+    every lost entry as 'interrupted'. The queue itself is volatile: restart
+    loss is accepted and announced by a fixed-code log, never silent. poll()
+    performs at most one bounded head check per pane; the runtime owns run().
+
+    After any send to a pane, an in-flight edge gate blocks the next send to
+    that pane until agent_status is observed non-idle and back at idle/done.
+    agent_status lags the TUI, so a still-'idle' read inside that window is not
+    proof the pane can take the next prompt. If the edge is never observed the
+    gate opens anyway after `edge_cap` seconds and the miss is logged.
+    """
+
+    def __init__(self, core: BridgeCore, *, get: Callable[[str], Agent],
+                 prompt: Callable[[str, str], None], send: Callable[[Origin, str], str],
+                 clock: Callable[[], float] = time.monotonic,
+                 interval: float = QUEUE_INTERVAL, timeout: float = QUEUE_TIMEOUT,
+                 edge_cap: float = QUEUE_EDGE_CAP,
+                 audit: Callable[[str, int, str, str], None] | None = None,
+                 stopping: Callable[[], bool] = lambda: False) -> None:
+        for value in (interval, timeout, edge_cap):
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or not math.isfinite(value) or value <= 0):
+                raise ValueError("Queue timings must be finite positive numbers")
+        self._core, self._get, self._prompt, self._send = core, get, prompt, send
+        self._clock, self._interval, self._timeout = clock, float(interval), float(timeout)
+        self._edge_cap = float(edge_cap)
+        self._audit, self._external_stopping = audit, stopping
+        self._queues: dict[str, deque[QueuedPrompt]] = {}
+        self._inflight: dict[str, float] = {}  # pane -> last submit time awaiting its busy edge
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stopped = False
+
+    def _stopping(self) -> bool:
+        try:
+            return self._stopped or bool(self._external_stopping())
+        except Exception:
+            return True
+
+    def _emit(self, entry: QueuedPrompt | None, event: str, reason: str) -> None:
+        if self._audit is not None:
+            try:
+                self._audit(entry.message.message_id if entry else "queue",
+                            entry.binding.revision if entry else 0, event, reason)
+            except Exception:
+                pass  # Never leak exception text or retry an operation to log it.
+
+    def pending(self, pane_id: str) -> bool:
+        with self._lock:
+            return bool(self._queues.get(pane_id)) or pane_id in self._inflight
+
+    def enqueue(self, message: Message, binding: Binding, kind: str) -> None:
+        """Caller holds the shared operation lock; the row stays 'processing'."""
+        entry = QueuedPrompt(message, binding, kind, self._clock())
+        with self._lock:
+            self._queues.setdefault(binding.pane_id, deque()).append(entry)
+        self._emit(entry, "enqueued", "busy")
+        self._wake.set()
+
+    def mark_submitted(self, pane_id: str) -> None:
+        """Record a send; the pane must prove a busy edge before the next one."""
+        with self._lock:
+            self._inflight[pane_id] = self._clock()
+        self._wake.set()
+
+    def request_stop(self) -> None:
+        self._stopped = True
+        self._wake.set()
+
+    def stop(self) -> None:
+        self.request_stop()
+        with self._lock:
+            remaining = sum(len(queue) for queue in self._queues.values())
+            self._queues.clear()
+            self._inflight.clear()
+        if remaining:
+            # Their rows stay 'processing'; startup recovery settles them as
+            # 'interrupted'. This log is the required record of the in-memory loss.
+            self._emit(None, "lost", "restart")
+
+    def _origin(self, entry: QueuedPrompt) -> Origin:
+        return Origin(entry.message.message_id, entry.message.chat_id, entry.message.user_id,
+                      entry.binding.herdr_session, entry.binding.workspace_id, entry.binding.pane_id,
+                      entry.binding.revision, self._core.bot_open_id, entry.kind,
+                      entry.message.chat_type)
+
+    def _finish(self, entry: QueuedPrompt, status: str, code: str) -> bool:
+        try:
+            self._core.store.finish(entry.message.message_id, status, code, self._core.clock())
+            return True
+        except Exception:
+            return False
+
+    def _pop(self, entry: QueuedPrompt) -> None:
+        with self._lock:
+            queue = self._queues.get(entry.binding.pane_id)
+            if queue and queue[0] is entry:
+                queue.popleft()
+            if queue is not None and not queue:
+                del self._queues[entry.binding.pane_id]
+
+    def _settle(self, entry: QueuedPrompt, status: str, code: str, notice: str | None,
+                *, sent: bool = False) -> bool:
+        """Persist the terminal state before any definitive receipt or dequeue.
+
+        Entries whose send was never attempted stay queued when the write fails
+        and are retried by the next poll; once a send was attempted the entry is
+        consumed exactly once regardless of the bookkeeping result.
+        """
+        persisted = self._finish(entry, status, code)
+        if not persisted and not sent:
+            self._emit(entry, "poll", "settle_failed")
+            return False
+        self._emit(entry, "closed", code)
+        if not persisted:
+            self._emit(entry, "poll", "persist_failed")
+        if notice is not None:
+            try:
+                self._send(self._origin(entry), notice)
+            except Exception:
+                pass
+        self._pop(entry)
+        return True
+
+    def _gate(self, entry: QueuedPrompt, agent: Agent, now: float) -> bool:
+        """In-flight edge gate: True when this pane may take the next send."""
+        with self._lock:
+            inflight_at = self._inflight.get(entry.binding.pane_id)
+            if agent.status not in _QUEUE_IDLE:
+                if inflight_at is not None:
+                    del self._inflight[entry.binding.pane_id]
+                    self._emit(entry, "edge", "observed")
+                return False
+            if inflight_at is None:
+                return True
+            if now - inflight_at < self._edge_cap:
+                return False  # Stale-idle window: the busy edge is not proven yet.
+            del self._inflight[entry.binding.pane_id]
+            self._emit(entry, "edge", "unobserved")
+            return True
+
+    def _current_binding(self, entry: QueuedPrompt) -> Binding | None:
+        try:
+            current = self._core.store.get_binding(entry.message.chat_id)
+        except Exception:
+            current = None
+        if (current is None or not current.valid
+                or (current.revision, current.herdr_session, current.workspace_id, current.pane_id)
+                != (entry.binding.revision, entry.binding.herdr_session,
+                    entry.binding.workspace_id, entry.binding.pane_id)):
+            return None
+        return current
+
+    def _submit(self, entry: QueuedPrompt) -> bool:
+        """One bounded send attempt under the shared operation lock.
+
+        The pane status is re-read inside the lock, the in-flight edge gate
+        must be satisfied, and the captured baseline must itself prove an
+        idle/done frame: a busy baseline or a send-point flip keeps the head
+        queued instead of submitting.
+        """
+        core = self._core
+        if not core._lock.acquire(blocking=False):
+            return False  # A foreground operation owns the slot; retry next poll.
+        try:
+            try:
+                agent = self._get(entry.binding.pane_id)
+            except Exception:
+                self._emit(entry, "poll", "get_failed")
+                return False
+            if agent.workspace_id != entry.binding.workspace_id:
+                core._invalidate_quietly(entry.binding, "prompt")
+                return self._settle(entry, "failed", "workspace_mismatch",
+                                    "目标 pane 已变化，排队消息未发送。")
+            if not self._gate(entry, agent, self._clock()):
+                return False
+            if self._current_binding(entry) is None:
+                return self._settle(entry, "failed", "binding_changed",
+                                    "绑定已变化，排队消息未发送。")
+            label = core._label(entry.binding)
+            capture = None
+            armed = False
+            output = core.output
+            try:
+                if output is not None and entry.message.chat_type == "group":
+                    try:
+                        output.cancel_current(entry.message.chat_id)
+                        capture = output.capture(self._origin(entry), entry.message.text)
+                    except Exception:
+                        capture = None
+                if capture is not None and getattr(
+                        getattr(capture, "_baseline", None), "status", None) not in _QUEUE_IDLE:
+                    # The baseline itself is busy or unproven: cancel and wait.
+                    self._emit(entry, "poll", "baseline_busy")
+                    return False
+                try:
+                    agent = self._get(entry.binding.pane_id)
+                except Exception:
+                    self._emit(entry, "poll", "get_failed")
+                    return False
+                if agent.workspace_id != entry.binding.workspace_id:
+                    core._invalidate_quietly(entry.binding, "prompt")
+                    return self._settle(entry, "failed", "workspace_mismatch",
+                                        "目标 pane 已变化，排队消息未发送。")
+                if agent.status not in _QUEUE_IDLE:
+                    self._emit(entry, "poll", "status_changed")
+                    return False  # Flipped between capture and send; keep waiting.
+                if self._current_binding(entry) is None:
+                    return self._settle(entry, "failed", "binding_changed",
+                                        "绑定已变化，排队消息未发送。")
+                try:
+                    self._prompt(entry.binding.pane_id, entry.message.text)
+                except HerdrError as exc:
+                    core._invalidate_quietly(entry.binding, "prompt")
+                    return self._settle(entry, "unknown" if exc.uncertain else "failed",
+                                        exc.code, f"{label}排队消息发送未获确认（{exc.code}）。",
+                                        sent=True)
+                except Exception:
+                    core._invalidate_quietly(entry.binding, "prompt")
+                    return self._settle(entry, "unknown", "internal_error",
+                                        f"{label}排队消息发送失败，请检查现场后重发。",
+                                        sent=True)
+                settled = self._settle(entry, "done", "submitted", None, sent=True)
+                self.mark_submitted(entry.binding.pane_id)
+                if capture is not None and settled:
+                    try:
+                        armed = bool(output.arm(capture))
+                    except Exception:
+                        armed = False  # Auxiliary observation never changes submission.
+                return True
+            finally:
+                if capture is not None and not armed:
+                    try:
+                        output.cancel(capture)
+                    except Exception:
+                        pass
+        finally:
+            core._lock.release()
+
+    def poll(self) -> bool:
+        """Drive each pane's head once; True when at least one entry settled."""
+        if self._stopping():
+            return False
+        now = self._clock()
+        if not math.isfinite(now):
+            self.request_stop()
+            return False
+        with self._lock:
+            heads = [queue[0] for queue in self._queues.values() if queue]
+        consumed = False
+        for entry in heads:
+            if self._stopping():
+                break
+            if now - entry.enqueued_at >= self._timeout:
+                consumed = self._settle(entry, "failed", "queue_timeout",
+                                        f"{self._core._label(entry.binding)}pane 持续忙，未发送。") or consumed
+            else:
+                consumed = self._submit(entry) or consumed
+        return consumed
+
+    def run(self) -> None:
+        """One runtime-owned thread; waits are interruptible, never busy."""
+        try:
+            while not self._stopping():
+                if self.poll():
+                    continue
+                self._wake.wait(self._interval)
+                self._wake.clear()
+        except Exception:
+            self.request_stop()  # Never log raw exceptions or replay a failed poll.
+        finally:
+            self.stop()
+
+
+def connect_send_queue(core: BridgeCore, adapter: HerdrAdapter, send: Callable[[Origin, str], str],
+                       *, clock: Callable[[], float] = time.monotonic,
+                       interval: float = QUEUE_INTERVAL, timeout: float = QUEUE_TIMEOUT,
+                       edge_cap: float = QUEUE_EDGE_CAP,
+                       stopping: Callable[[], bool] = lambda: False) -> SendQueue:
+    """Wire one volatile send queue; pending entries are lost on restart."""
+
+    def audit(ref: str, revision: int, event: str, reason: str) -> None:
+        logging.getLogger(__name__).info(
+            "send-queue message=%s revision=%s event=%s reason=%s", ref, revision, event, reason)
+
+    queue = SendQueue(core, get=adapter.get_agent, prompt=adapter.prompt, send=send,
+                      clock=clock, interval=interval, timeout=timeout, edge_cap=edge_cap,
+                      audit=audit, stopping=stopping)
+    core.send_queue = queue
+    return queue
+
+
 class GroupCreateError(Exception):
     def __init__(self, *, created_chat_id: str | None = None, uncertain: bool = True) -> None:
         super().__init__("group_create_failed")
@@ -92,6 +408,7 @@ class BridgeCore:
         self.clock = clock
         self.projects = dict(projects or {})
         self.output: OutputObserver | None = None
+        self.send_queue: SendQueue | None = None
         self._output_capture: Observation | None = None
         self.management_chat_id = management_chat_id
         self.admin_users = frozenset(admin_users)
@@ -214,6 +531,8 @@ class BridgeCore:
                 # Never expose exception repr: it may contain a prompt or CLI output.
                 self._invalidate_quietly(snapshot, action)
                 reply = Reply("unknown", "internal_error", "操作结果不明，未自动重试，请检查现场。")
+            if action == "prompt" and reply.code == "queued":
+                return reply  # The row stays 'processing'; SendQueue settles it later.
             recorded = self._record(message, snapshot, action, reply)
             if action == "prompt" and recorded.status == "done" and recorded.code == "submitted":
                 enabled = False
@@ -371,9 +690,18 @@ class BridgeCore:
             truncated = len(lines) > 80 or len(content) > 3000
             content = content[:3000]
             return Reply("done", "read", f"{label}\n{content}" + ("\n[输出已截断]" if truncated else ""))
+        if (self.send_queue is not None and message.chat_type == "group"
+                and (agent.status not in _QUEUE_IDLE or self.send_queue.pending(snapshot.pane_id))):
+            # Group prompts capture a baseline, so a busy pane must not be sent
+            # mid-render (Issue #24). Queue strictly FIFO; private chats never
+            # captured baselines and keep the original immediate path.
+            self.send_queue.enqueue(message, snapshot, agent.kind)
+            return Reply("done", "queued", f"{label}已排队，等 pane 空闲后发送。")
         self._capture_output(message, snapshot, agent)
         self._assert_current(snapshot)  # Capture added reads; never bypass a changed binding.
         self.herdr.prompt(snapshot.pane_id, message.text)
+        if self.send_queue is not None:
+            self.send_queue.mark_submitted(snapshot.pane_id)
         return Reply("done", "submitted", f"{label}已提交，尚未确认任务完成。")
 
     def _stop_output(self) -> None:
