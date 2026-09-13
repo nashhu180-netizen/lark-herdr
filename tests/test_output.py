@@ -1166,6 +1166,41 @@ class ObserverTests(unittest.TestCase):
                              ["get", "read"])
             self.assertIn(("capture", 1, "declined", "read_failed"), r.logs)
 
+    def test_real_sampled_devin_working_frames_parse(self):
+        # Issue #28: live validation produced `capture=declined
+        # reason=frame_unparsed` — real Devin working frames whose status bar
+        # shows the "Press alt+t to cycle thinking levels" hint instead of the
+        # "Context: N / N tokens (N%)" meter were rejected on every read.
+        # These fixtures are verbatim frames sampled from our own disposable
+        # pane (w1V:p5) during a `sleep 30` working turn; the samples carry
+        # no user/home paths or credentials.
+        fixture_dir = Path(__file__).parent / "fixtures"
+        for name in ("devin_working_live_alt_hint.txt",
+                     "devin_working_live_context.txt",
+                     "devin_working_live_running_tools.txt"):
+            with self.subTest(fixture=name):
+                frame = out._frame(
+                    "devin", (fixture_dir / name).read_text(encoding="utf-8"))
+                self.assertIsNotNone(frame)
+                self.assertEqual(frame.status, "working")
+                self.assertTrue(frame.real)
+
+    def test_working_capture_arms_on_real_alt_hint_frame(self):
+        # The sampled alt-hint frame is the shape that declined live with
+        # frame_unparsed; as a working baseline it must arm on the first read
+        # (a valid frame needs no retry).
+        from dataclasses import replace
+        r = Rig()
+        origin = r.origin()
+        r.states[origin.pane_id] = replace(r.states[origin.pane_id],
+                                         status="working")
+        r.screens[origin.pane_id] = (
+            Path(__file__).parent / "fixtures/devin_working_live_alt_hint.txt"
+        ).read_text(encoding="utf-8")
+        watch = r.arm(origin, "请只执行 sleep 30 这一条命令，不要做别的")
+        self.assertIsNotNone(watch)
+        self.assertEqual([call[0] for call in r.calls], ["get", "read"])
+
     def test_capture_declines_emit_fixed_reason_codes(self):
         # Every capture() return-None exit emits exactly one declined audit
         # event carrying a fixed machine code; no content is logged.
