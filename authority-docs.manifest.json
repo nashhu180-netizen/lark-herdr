@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "document_roots": [
+    "docs"
+  ],
+  "exclude": [],
+  "entries": [
+    {
+      "kind": "watched",
+      "document": "docs/design.md",
+      "watch": [
+        "feishu_herdr_bridge"
+      ],
+      "last_verified": {
+        "repo": "self",
+        "sha": "ee57eca173bb7994695d44a9643fb577eb10922a"
+      }
+    },
+    {
+      "kind": "watched",
+      "document": "docs/auto-pane-output-design.md",
+      "watch": [
+        "feishu_herdr_bridge/output.py",
+        "feishu_herdr_bridge/core.py"
+      ],
+      "last_verified": {
+        "repo": "self",
+        "sha": "09d02c32f509fd9a12d4cdad6e3e47af6f81a6e7"
+      }
+    },
+    {
+      "kind": "watched",
+      "document": "docs/devin-agent-design.md",
+      "watch": [
+        "feishu_herdr_bridge/herdr.py",
+        "feishu_herdr_bridge/store.py",
+        "feishu_herdr_bridge/core.py"
+      ],
+      "last_verified": {
+        "repo": "self",
+        "sha": "0de93b578f28f5cbe9b20dff70a7a6b146ba2981"
+      }
+    },
+    {
+      "kind": "watched",
+      "document": "docs/runbook.md",
+      "watch": [
+        "deploy",
+        "examples",
+        "feishu_herdr_bridge"
+      ],
+      "last_verified": {
+        "repo": "self",
+        "sha": "3c66fd38175c8413abcec991492bf29e57d8a9c2"
+      }
+    },
+    {
+      "kind": "exempt",
+      "document": "docs/development-plan.md",
+      "reason": "历史 MVP 实施计划档案：记录的是当时的过程口径，不随代码变化要求复查"
+    },
+    {
+      "kind": "exempt",
+      "document": "docs/devin-agent-plan.md",
+      "reason": "Issue #5 批次实施计划档案：设计事实看护挂在 devin-agent-design.md，计划本身随任务收口归档"
+    },
+    {
+      "kind": "exempt",
+      "document": "docs/auto-pane-output-plan.md",
+      "reason": "Issue #7 批次实施计划档案：设计事实看护挂在 auto-pane-output-design.md，计划本身随任务收口归档"
+    },
+    {
+      "kind": "exempt",
+      "document": "docs/self-service-groups-plan.md",
+      "reason": "Issue #3 批次实施计划档案：设计事实看护挂在 design.md，计划本身随任务收口归档"
+    },
+    {
+      "kind": "exempt",
+      "document": "docs/live-validation.md",
+      "reason": "真实验收证据快照：历史记录不可改写、不随代码变化失新"
+    },
+    {
+      "kind": "exempt",
+      "document": "docs/self-service-groups-validation.md",
+      "reason": "真实验收证据快照：历史记录不可改写、不随代码变化失新"
+    },
+    {
+      "kind": "exempt",
+      "document": "docs/dev-plan.md",
+      "reason": "DevPlan 任务户口本：结构性登记工件，由维护流程自身治理，不作代码事实看护"
+    },
+    {
+      "kind": "exempt",
+      "document": "docs/README.md",
+      "reason": "docs 入口索引：新增/退役/挪位文档时同批更新；不作代码事实看护"
+    }
+  ]
+}
