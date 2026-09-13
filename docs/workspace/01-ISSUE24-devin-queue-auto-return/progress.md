@@ -13,11 +13,11 @@
    更早历史（23:42/23:50/23:51 三个 armed→sent）证明 armed→sent 链路本身工作。
 
 2. 调用链（live=main@04f1580 与本分支此处相同）：`execute → _dispatch(prompt) → _capture_output`（先 `_cancel_output` 杀旧 watch → `output.capture`）→ `_assert_current → herdr.prompt`。**capture 严格先于 prompt 提交**——所以 capture 时刻画面里的队列只可能含*前一条*提示，不可能含本条。
-   `capture()`→None 的 11 个出口逐条枚举并评估见 `findings.md` F-001。
+   `capture()`→None 的语义条件组枚举并评估见 `findings.md` F-001。
 
-3. 新测试 `tests/test_output.py:1016–1150`：
-   - `test_live_issue24_second_prompt_during_working_turn_arms`：3 个忠实真实形态帧（Guide 输入 working 帧、队列含 P1、队列含 P2）全部 **armed（绿）** → 若 capture 时刻画面是已知形态，连 live 单读代码也会 armed。
-   - `test_live_issue24_working_capture_variants`：`torn_then_queued_frame` 绿（PR #25 重试生效；在 live 单读上为红）；`torn_twice`/`two_queued_rows`/`read_raises` 按合同 fail-closed 返回 None（同时证明 PR #25 对这些类别无能为力）；`cancelled_watch_leaves_no_residue`、`shared_prefix_prompt` 绿（计划变体 b/c 排除）。
+3. 新测试 `tests/test_output.py`（本节原名/原表述已被 audit-B1 撤回，B2 段整改后现行名为）：
+   - `test_issue24_second_prompt_during_working_turn_arms`（原 `test_live_issue24_…`）：Issue #24 建模场景，synthetic fixtures 非 live 捕获帧，working 帧 → armed。
+   - `test_working_capture_variants`（原 `test_live_issue24_working_capture_variants`）：`torn_then_queued_frame` 为 synthetic hypothesis（PR #25 重试路径生效，不代表已复现现场）；`torn_twice`/`two_queued_rows`/`read_raises` 按合同 fail-closed；`queue_chrome_*` 两例为解析器回归（新提示在 capture 时刻不可能在队列）；`cancelled_watch_leaves_no_residue`、`shared_prefix_prompt`（变体 b/c 排除）。
 
 4. 验证输出：
    - `.venv/bin/python -m unittest tests.test_output -k issue24 -v` → `Ran 2 tests … OK`
@@ -25,7 +25,7 @@
    - `.venv/bin/python -m compileall -q feishu_herdr_bridge tests` → 无输出
    - `git diff --check` → 干净；`git status` → 仅 `M tests/test_output.py` + 未跟踪 `docs/workspace/`
 
-5. 结论：**F-001 = PR #25 的撕裂假设与现场一致且为最简解释，但离线无法排除其不覆盖的两类替代根因（持续性未识别真实帧形态 / get-read 边界或状态检测异常）；区分需 capture 时刻真实帧。** 详见 findings.md。
+5. 结论（**B1 当时记录；audit-B1 changes-requested 后以下口径作废**，现行口径以 findings.md F-001 为准）：原写"撕裂假设为最简解释"系无判别证据的排序，已撤回。现行：capture()→None 候选集非穷尽，分「已排除 / 有旁证未排除 / 未知」三栏；撕裂帧仅为假设 (i)，区分需 live capture 时刻证据（B2 取证日志为此而加）。
 
 ## B2 证据（修复 + 测试；D-001 裁决 b + audit-B1 changes-requested 整改）
 
@@ -48,3 +48,13 @@ audit-B1.md 开工前已落地（changes-requested），A-B1-001/002/003 三条�
 - `.venv/bin/python -m compileall -q feishu_herdr_bridge tests` → 无输出。
 - `git diff --check` → 干净。
 - **非失败警告（A-B1-003 补记）**：全量运行含 2 条依赖 DeprecationWarning（lark_oapi `utcfromtimestamp`、`get_event_loop`）与末尾 1 条 `ResourceWarning: unclosed event loop`；另有 `HerdR contract=static-not-live` WARNING 与既有 `event=closed reason=cancelled` INFO 样例行——均不影响 exit 0。
+
+## rework-1 证据（audit-B2 changes-requested 整改，并入 B2 收尾）
+
+- **A-B2-001**：本文件 B1 段逐处清理被 D-002 撤回的表述——测试名改回现行名并标注"已被 audit-B1 撤回"、删"3 个忠实真实形态帧"、删"在 live 单读上为红"、第 5 条结论标注作废并指向 F-001 现行候选集口径；同步把"11 个出口逐条枚举"改为"语义条件组"。
+- **A-B2-002**：`orchestration/reviews/audit-B1.md:3-4` 两处尾随空格已删（仅空格，内容未动）。纠正验证口径：范围级 `git diff --check 83c4302..HEAD` 才是本 PR 的门禁，裸 `git diff --check` 只查未提交 diff——B2 段"干净"记录对应后者，前者当时实际失败，本条如实更正。
+
+rework-1 验证输出：
+- `env -u FEISHU_APP_ID -u FEISHU_APP_SECRET .venv/bin/python -m unittest discover -s tests` → `Ran 302 tests in 42.717s — OK`（同样的 2 条 DeprecationWarning + 末尾 1 条 ResourceWarning，非失败）。
+- `.venv/bin/python -m compileall -q feishu_herdr_bridge tests` → 无输出。
+- `git diff --check`（工作区）→ 干净；`git diff --check 83c4302..HEAD`（范围级）结果见 commit 后复跑行。

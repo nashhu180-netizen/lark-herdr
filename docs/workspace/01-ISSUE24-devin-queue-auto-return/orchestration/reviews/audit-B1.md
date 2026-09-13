@@ -1,7 +1,7 @@
 # audit-B1 — ISSUE24 根因确认小审
 
-审核者：gpt-5.6-sol 独立审核 worker（未参与实施）  
-审核对象：`83c4302977ca8750e0cc86fd975f53f8a18041d5` + 未提交 `tests/test_output.py` B1 diff + `findings.md` F-001 + `progress.md`  
+审核者：gpt-5.6-sol 独立审核 worker（未参与实施）
+审核对象：`83c4302977ca8750e0cc86fd975f53f8a18041d5` + 未提交 `tests/test_output.py` B1 diff + `findings.md` F-001 + `progress.md`
 审核边界：只读代码；仅写本报告。
 
 ## 结论先行
