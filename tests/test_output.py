@@ -199,9 +199,10 @@ class RealDevinExtractionTests(unittest.TestCase):
     def test_did_you_know_tip_blocks_drop_by_structure_not_text(self):
         # Did-you-know tips are UI chrome: the header line and its
         # deeper-indented continuation lines are dropped wherever the block
-        # appears, without enumerating tip texts (Issue #28 P3; supersedes
-        # the earlier single-text exclusion from PR #23).
+        # appears, without enumerating tip texts (Issue #30 P3; supersedes
+        # the earlier single-text exclusion from b6de85e).
         before = devin_screen(DEVIN_HISTORY)
+        # Sample 1: the b6de85e-era tip, at the transcript tail.
         after = self.round(
             " P1_LIVE_OK", "", " ✱ Did you know",
             "   Use /bug to report a bug to the Devin CLI developers",
@@ -210,13 +211,24 @@ class RealDevinExtractionTests(unittest.TestCase):
             out.extract_new_text("devin", before, after, self.PROMPT).body,
             "P1_LIVE_OK",
         )
+        # Sample 2: the verbatim tip that leaked into a live auto-return.
         mid = self.round(
             " ✱ Did you know",
-            "   Press Ctrl+L to clear the screen, Ctrl+Shift+L to redraw",
+            "   Use Shift+Tab to cycle permission modes, and /plan and "
+            "/ask to switch profiles",
             "", " P1_LIVE_OK",
         )
         self.assertEqual(
             out.extract_new_text("devin", before, mid, self.PROMPT).body,
+            "P1_LIVE_OK",
+        )
+        # Sample 3: another verbatim tip text seen on Devin CLI.
+        other = self.round(
+            " P1_LIVE_OK", "", " ✱ Did you know",
+            "   Type @ to mention files and add them as context",
+        )
+        self.assertEqual(
+            out.extract_new_text("devin", before, other, self.PROMPT).body,
             "P1_LIVE_OK",
         )
 
