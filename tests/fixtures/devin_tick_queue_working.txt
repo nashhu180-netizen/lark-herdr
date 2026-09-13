@@ -1,0 +1,45 @@
+ 净。
+
+ 变异： alt+t  尾  levels → levelz  → 施加态 hash  1a137548…3faa ，2 处红（alt_hint fixture 解析 + arm 测试），其余尾 subTest 仍绿
+ → 还原态  76ece9f7…1bd0 （=基线，o28 树净）。
+
+ 遗留说明（不阻断）：尾部白名单上限=已观测 4 种，第 5 种尾会再  frame_unparsed ——但拒绝码日志正是 Issue #28 的定位机制，属 fail-
+ closed 已知边界；裸尾行（无模型名前缀）不匹配，保守方向。
+
+ 两棵树均已净：o28 零残留，o24 仅新增两份复核报告。
+
+ ✱ Did you know
+   Use Shift+Tab to cycle permission modes, and /plan and /ask to switch profiles
+
+❭ 请只执行 sleep 30 这一条命令，不要做别的
+
+ ⏺ Read shell fe53e8
+ │ Timeout: 30s
+ └ Session: fe53e8
+
+ ⏺ Ran command
+ │ $ sleep 30
+ │ Timeout: 45s
+ │ Exited with code 0 and no output
+ │ Exit code: 0
+ └ Exited with code 0
+
+  sleep 30  已执行完毕（exit 0）。
+
+❭ 回复标记 PONG-D，收到后只回复这一行
+
+ PONG-D
+
+❭ 请只执行 sleep 30 这一条命令，不要做别的
+
+ ○ Running command
+ │ $ sleep 30
+ │ Timeout: 45s
+
+⡆⠀ Running tools · 16s (esc twice to interrupt)
+── 1 queued ──────────────────────────────────────────────────────────────────────────────────────────────── ↑ edit · ↵ send now ──
+○ 回复标记 PONG-D，收到后只回复这一行
+───────────────────────────────────────────────────────────────────────────────────────────────────────── (bypass permissions on) ─
+❭ Press Enter to send queued messages now
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+SWE-2 Max                                                                                         Context: 102k / 262k tokens (38%)

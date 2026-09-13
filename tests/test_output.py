@@ -196,7 +196,11 @@ class RealDevinExtractionTests(unittest.TestCase):
         after = self.round(" P1_LIVE_OK")
         self.assertEqual(out.extract_new_text("devin", before, after, self.PROMPT).body, "P1_LIVE_OK")
 
-    def test_exact_did_you_know_tip_after_answer_is_not_returned(self):
+    def test_did_you_know_tip_blocks_drop_by_structure_not_text(self):
+        # Did-you-know tips are UI chrome: the header line and its
+        # deeper-indented continuation lines are dropped wherever the block
+        # appears, without enumerating tip texts (Issue #28 P3; supersedes
+        # the earlier single-text exclusion from PR #23).
         before = devin_screen(DEVIN_HISTORY)
         after = self.round(
             " P1_LIVE_OK", "", " ✱ Did you know",
@@ -206,14 +210,63 @@ class RealDevinExtractionTests(unittest.TestCase):
             out.extract_new_text("devin", before, after, self.PROMPT).body,
             "P1_LIVE_OK",
         )
-        near_match = self.round(
-            " P1_LIVE_OK", "", " ✱ Did you know",
-            "   Arbitrary assistant text must remain visible",
+        mid = self.round(
+            " ✱ Did you know",
+            "   Press Ctrl+L to clear the screen, Ctrl+Shift+L to redraw",
+            "", " P1_LIVE_OK",
         )
-        self.assertIn(
-            "Arbitrary assistant text must remain visible",
-            out.extract_new_text("devin", before, near_match, self.PROMPT).body,
+        self.assertEqual(
+            out.extract_new_text("devin", before, mid, self.PROMPT).body,
+            "P1_LIVE_OK",
         )
+
+    @staticmethod
+    def _live_fixture(name):
+        return (Path(__file__).parent / "fixtures" / name).read_text(encoding="utf-8")
+
+    def test_real_frames_verbatim_reply_declines_echo_only(self):
+        # Issue #24 F-004/F-005: the live deadline traced to a Devin reply
+        # byte-identical to its prompt — `echo_only` is the contractual
+        # refusal (a candidate identical to the prompt is not sent), and
+        # marker-protocol validations must use non-verbatim replies.
+        # Frames are verbatim w1V:p5 samples: baseline = done state before
+        # the marker prompt; after = marker echo plus the verbatim reply.
+        result = out.extract_new_text(
+            "devin", self._live_fixture("devin_tick_done_baseline.txt"),
+            self._live_fixture("devin_tick_marker_echo_done.txt"),
+            "ISSUE24 验收标记 D")
+        self.assertIsNone(result.body)
+        self.assertEqual(result.reason, "echo_only")
+
+    def test_real_frames_tip_blocks_never_enter_body(self):
+        # The real sampled working-queue frame (second sleep running,
+        # PONG-D queued) and the done frame (queued prompt answered) both
+        # parse; every Did-you-know tip in them is removed structurally —
+        # no tip row or tip text survives in the parsed frame.
+        for name in ("devin_tick_queue_working.txt",
+                     "devin_tick_done_baseline.txt",
+                     "devin_tick_marker_echo_done.txt"):
+            with self.subTest(fixture=name):
+                frame = out._frame("devin", self._live_fixture(name))
+                self.assertIsNotNone(frame)
+                self.assertFalse(any("Did you know" in row
+                                     for row in frame.rows))
+                self.assertFalse(any("Did you know" in block.text
+                                     for block in frame.blocks))
+
+    def test_real_frames_scrolled_transcript_fails_closed_overlap(self):
+        # The queue-working and done frames above are minutes apart; the
+        # 80-line visible window scrolled between them, so the baseline is
+        # not a prefix of the after frame and no unique overlap anchor
+        # exists. Extraction fails closed with ambiguous_overlap (F-004
+        # candidate b is real: scrolling breaks alignment; contract keeps
+        # it unsent rather than guessing).
+        result = out.extract_new_text(
+            "devin", self._live_fixture("devin_tick_queue_working.txt"),
+            self._live_fixture("devin_tick_done_baseline.txt"),
+            "回复标记 PONG-D，收到后只回复这一行")
+        self.assertIsNone(result.body)
+        self.assertEqual(result.reason, "ambiguous_overlap")
 
     def test_tool_lines_and_blank_separators_are_not_body(self):
         before = devin_screen(DEVIN_HISTORY)

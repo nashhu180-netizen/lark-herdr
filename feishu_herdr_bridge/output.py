@@ -86,10 +86,10 @@ _DEVIN_QUEUE_INPUT = "❭ Press Enter to send queued messages now"
 _DEVIN_TOOL_HEAD = re.compile(r" [○◐◔◑◕⏺] ")
 _DEVIN_USER_CONT = re.compile(r"  \S")
 _DEVIN_TOOL_BODY = ("│", " │", " └")
-_DEVIN_DID_YOU_KNOW_TIP = (
-    " ✱ Did you know",
-    "   Use /bug to report a bug to the Devin CLI developers",
-)
+# Did-you-know tips are cycling UI hints, not transcript content: the header
+# line plus its deeper-indented continuation lines are dropped by structure,
+# wherever the block appears (text is not enumerated).
+_DEVIN_DID_YOU_KNOW = " ✱ Did you know"
 
 
 def _devin_frame(lines: list[str]) -> _Frame | None:
@@ -124,10 +124,14 @@ def _devin_frame(lines: list[str]) -> _Frame | None:
 
     while transcript and blank(transcript[-1]):
         transcript.pop()  # Pre-chrome blank rows are spacing, not transcript.
-    if tuple(transcript[-2:]) == _DEVIN_DID_YOU_KNOW_TIP:
-        del transcript[-2:]
-        while transcript and blank(transcript[-1]):
-            transcript.pop()
+    i = 0
+    while i < len(transcript):
+        if transcript[i] == _DEVIN_DID_YOU_KNOW:
+            del transcript[i]
+            while i < len(transcript) and transcript[i].startswith("  "):
+                del transcript[i]
+        else:
+            i += 1
     blocks: list[_Block] = []
     i, n = 0, len(transcript)
 
