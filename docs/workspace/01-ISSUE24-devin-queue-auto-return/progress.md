@@ -57,4 +57,4 @@ audit-B1.md 开工前已落地（changes-requested），A-B1-001/002/003 三条�
 rework-1 验证输出：
 - `env -u FEISHU_APP_ID -u FEISHU_APP_SECRET .venv/bin/python -m unittest discover -s tests` → `Ran 302 tests in 42.717s — OK`（同样的 2 条 DeprecationWarning + 末尾 1 条 ResourceWarning，非失败）。
 - `.venv/bin/python -m compileall -q feishu_herdr_bridge tests` → 无输出。
-- `git diff --check`（工作区）→ 干净；`git diff --check 83c4302..HEAD`（范围级）结果见 commit 后复跑行。
+- `git diff --check`（工作区）→ 干净；`git diff --check 83c4302`（工作区对基线）→ 干净；commit 后 `git diff --check 83c4302..HEAD` → 干净。

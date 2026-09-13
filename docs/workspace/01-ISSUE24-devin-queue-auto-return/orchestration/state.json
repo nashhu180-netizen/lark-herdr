@@ -1,5 +1,5 @@
 {
-  "current_batch": "B3",
+  "current_batch": "B17",
   "batches": {
     "B1": {
       "status": "done",
@@ -10,19 +10,103 @@
       "note": "fix+tests: PR#25 保留 + capture 拒绝出口固定码审计 output capture=declined；audit-B1 三条整改并入"
     },
     "B3": {
-      "status": "dispatched",
-      "note": "audit"
+      "status": "done",
+      "note": "audit; rework-1 整改已合入 B2 收尾 commit c6584fa（A-B2-001 progress 旧表述撤回 + A-B2-002 尾随空格）"
     },
     "B4": {
-      "status": "pending",
+      "status": "done",
       "note": "fresh review"
     },
     "B5": {
-      "status": "pending",
-      "note": "deploy+live validation (user authorized)"
+      "status": "live-failed",
+      "note": "capture=declined reason=frame_unparsed (root cause ii)"
+    },
+    "B6": {
+      "status": "done",
+      "note": "PR#29 8a9b476+db36cde, 4 status-bar tails whitelisted, 305 tests"
+    },
+    "B7": {
+      "status": "done",
+      "note": "audit-B6 + round2-B6 in parallel"
+    },
+    "B8": {
+      "status": "live-partial",
+      "note": "P2 armed OK (frame_unparsed fixed) but deadline without body"
+    },
+    "B9": {
+      "status": "done",
+      "note": "Issue#30/PR#31 970714d echo_only pinned + tip block strip; rework-2 合入 1511ea2（A-B9-001 tip 剔除收紧为可证明 UI 边界+封顶2行+负向反例恢复；A-B9-002 F-006 引用更正 §4.2 第66行）；309 tests"
+    },
+    "B10": {
+      "status": "done",
+      "note": "rework-2 1511ea2 + rework-3 0dc06cc pushed（D-004 语义变更：PR#23 旧负向输入现预期整块剔除，测试改名 test_tip_header_at_boundary_drops_following_indent_line 引 D-004；PR#31 描述已追加变更说明）；re-audit + incremental review dispatched"
+    },
+    "B11": {
+      "status": "live-failed",
+      "note": "ambiguous_overlap on P1-working baseline (F-007)"
+    },
+    "B12": {
+      "status": "done",
+      "note": "Issue#32/PR#33 回显锚点重构 _extract（用户块回显=增量证明，before尾部对齐废除）；真实帧23帧采样 f_01~f_19→candidate PONG-F、f_20→ambiguous_overlap；语义变更3条已钉住（双回显ambiguous/游离块不否决/未回显等待）；313 tests；rework-1 143026e 已推（A-B12-001 行级增量证明恢复=prefix或尾部唯一再现≥2非空行、回显须落证明点后、正文行不得见于before；A-B12-002 回显保留空白+折行边界至多1空格、冒充用例钉住；A-B12-003 fixture头注释+digest账；A-B12-004 PR描述写实际unittest命令与venv路径）314 tests",
+      "pr": 33,
+      "issue": 32
+    },
+    "B13": {
+      "status": "done",
+      "kind": "audit+review",
+      "target": "PR#33",
+      "panes": [
+        "o24-audit",
+        "o24-review2"
+      ],
+      "result": "audit rework / review2 approved → D-005 改路线，PR#33 关闭"
+    },
+    "B14": {
+      "status": "merged+deployed",
+      "kind": "exec",
+      "scope": "send-side wait-for-idle",
+      "worktree": "/home/nash/work/lark-herdr-o34",
+      "note": "Issue#34/PR#35 commit 29134f6：SendQueue per-pane FIFO（poll 驱动，core._lock 内重读 status+binding，idle 点才 capture 基线）；group-only；queued 行保持 processing 复用未改动的 request-phase 守卫；超时 600s→queue_timeout+通知；重启丢失→recover interrupted+lost/restart 日志；queue_interval/queue_timeout 可配置；output.py 未动；12 新例全 fake herdr；unittest 322 OK。真实验证 F-009 通过：w1V:p7 一次性 pane，sleep30 working 中第二条→queued→done 瞬间 closed/submitted→armed→PONG-J 回传。rework-1 0403752 已推（audit-B14 五条全关：A-001 in-flight 边沿闸每次发送后须观察 non-idle→idle/done 才放行下一条含即时路径，queue_edge_cap 默认15s 封顶记 edge/unobserved；A-002 发送点 fail-closed baseline.status∉{idle,done} 或 capture→send 翻转→cancel+队首保留；A-003 超时终态先落库再回执/出队，落库失败保留可重试；A-004 deferred capture 统一 finally 清理 prompt失败/arm异常；A-005 F-009a 完整 receipt=确定性 replay 脚本+逐字 audit+SQLite 行+SHA）；unittest 329 OK（test_queue 19 例）。未合未部署。注意：__main__.py 接线超出派单允许清单（生产必需，PR 已标注）",
+      "issue": 34,
+      "pr": 35,
+      "merge": "780db5a",
+      "deployed": "2026-09-13 16:26"
+    },
+    "B15": {
+      "status": "done",
+      "kind": "audit+review",
+      "result": "both approved after rework1"
+    },
+    "B16": {
+      "status": "passed",
+      "kind": "live-validation",
+      "marker": "PONG-M",
+      "time": "2026-09-13 16:39",
+      "finding": "F-010"
+    },
+    "B17": {
+      "status": "merged",
+      "kind": "exec",
+      "worktree": "/home/nash/work/lark-herdr-o36",
+      "note": "docs/issue24-acceptance 从 main=780db5a 切出；F-010 验收记录整理进 docs/live-validation.md（日期/commit/场景/日志时间线/结论格式）；Issue #24 评论验收结果（用户已先关闭）；Issue #32 按 D-005 口径关闭（改路线由 PR#35 解决）；PR 已开未合",
+      "pr": 36,
+      "merge": "PR#36"
     }
   },
-  "last_change": "B3 audit-B2 dispatched",
+  "last_change": "B17 done: F-010 → docs/live-validation.md, Issue #24 commented+closed, #32 closed per D-005, PR#36 open unmerged",
   "task": "ISSUE24",
-  "heartbeat": "2026-09-13 round29: exec working on B3 fix"
+  "side_tasks": {
+    "dh_init": {
+      "issue": 26,
+      "pr": 27,
+      "branch": "chore/dev-harness-init",
+      "worktree": "/home/nash/work/lark-herdr-dh",
+      "status": "pr-open-not-merged",
+      "note": "dev-harness 首次治理落地（7622377）：AGENTS.md 宪章+矩阵、CLAUDE.md 壳、docs/dev-plan.md 户口（issue-24 登记进行中）、docs/README.md 索引+挪位提案、authority-docs.manifest.json（4 watched/8 exempt，last_verified=各文档最后人工修订提交）；dh . 0 失败 1 警告（R5 命名差异）；dh docs 如实产出 4 篇存量工单"
+    }
+  },
+  "heartbeat": "2026-09-13 round207: controller working",
+  "pending_decisions": [],
+  "issue24": "closed-by-live-validation",
+  "status": "closed"
 }
