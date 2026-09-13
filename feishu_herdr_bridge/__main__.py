@@ -66,7 +66,8 @@ class BridgeRuntime:
 
     def __init__(self, core: BridgeCore, bot_open_id: str, send, runner: ManagedRunner,
                  *, output_reader=None, send_output=None, queue_adapter=None,
-                 queue_interval: float = 2.0, queue_timeout: float = 600.0) -> None:
+                 queue_interval: float = 2.0, queue_timeout: float = 600.0,
+                 queue_edge_cap: float = 15.0) -> None:
         self.stopping = False
         self.runner = runner
         self._guard = threading.Lock()
@@ -76,6 +77,7 @@ class BridgeRuntime:
                        if output_reader is not None and send_output is not None else None)
         self.queue = (connect_send_queue(core, queue_adapter, send_output,
                                          interval=queue_interval, timeout=queue_timeout,
+                                         edge_cap=queue_edge_cap,
                                          stopping=lambda: self.stopping)
                       if queue_adapter is not None and send_output is not None else None)
         self._output_thread: threading.Thread | None = None
@@ -170,13 +172,14 @@ class Config:
     admin_users: frozenset[str] = frozenset()
     queue_interval: float = 2.0
     queue_timeout: float = 600.0
+    queue_edge_cap: float = 15.0
 
 
 def load_config(path: Path) -> Config:
     raw = json.loads(path.read_text(encoding="utf-8"))
     required = {"herdr_executable", "herdr_session", "bot_open_id", "allowed_users", "allowed_chats", "projects"}
     optional = {"database", "query_timeout", "write_timeout", "management_chat_id", "admin_users",
-                "queue_interval", "queue_timeout"}
+                "queue_interval", "queue_timeout", "queue_edge_cap"}
     if not isinstance(raw, dict) or not required <= raw.keys() or raw.keys() - required - optional:
         raise ValueError("Invalid configuration keys; credentials must be supplied through the environment")
     executable, session = raw["herdr_executable"], raw["herdr_session"]
@@ -205,7 +208,8 @@ def load_config(path: Path) -> Config:
     if not isinstance(database, str) or not Path(database).is_absolute():
         raise ValueError("Database must use an absolute path")
     timeouts = (raw.get("query_timeout", 5.0), raw.get("write_timeout", 15.0),
-                raw.get("queue_interval", 2.0), raw.get("queue_timeout", 600.0))
+                raw.get("queue_interval", 2.0), raw.get("queue_timeout", 600.0),
+                raw.get("queue_edge_cap", 15.0))
     if any(type(t) not in (int, float) or not math.isfinite(t) or t <= 0 for t in timeouts):
         raise ValueError("Timeouts must be finite positive numbers")
     return Config(executable, session, raw["bot_open_id"], frozenset(raw["allowed_users"]),
@@ -250,7 +254,8 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None)
                                         output_reader=reader, send_output=transport.send_output_once,
                                         queue_adapter=queue_adapter,
                                         queue_interval=config.queue_interval,
-                                        queue_timeout=config.queue_timeout)
+                                        queue_timeout=config.queue_timeout,
+                                        queue_edge_cap=config.queue_edge_cap)
                 transport.is_stopping = lambda: runtime.stopping
                 with shutdown_signals(runtime):
                     try:

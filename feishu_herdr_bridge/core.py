@@ -81,6 +81,7 @@ class QueuedPrompt:
 _QUEUE_IDLE = {"idle", "done"}
 QUEUE_INTERVAL = 2.0
 QUEUE_TIMEOUT = 600.0
+QUEUE_EDGE_CAP = 15.0
 
 
 class SendQueue:
@@ -91,22 +92,31 @@ class SendQueue:
     every lost entry as 'interrupted'. The queue itself is volatile: restart
     loss is accepted and announced by a fixed-code log, never silent. poll()
     performs at most one bounded head check per pane; the runtime owns run().
+
+    After any send to a pane, an in-flight edge gate blocks the next send to
+    that pane until agent_status is observed non-idle and back at idle/done.
+    agent_status lags the TUI, so a still-'idle' read inside that window is not
+    proof the pane can take the next prompt. If the edge is never observed the
+    gate opens anyway after `edge_cap` seconds and the miss is logged.
     """
 
     def __init__(self, core: BridgeCore, *, get: Callable[[str], Agent],
                  prompt: Callable[[str, str], None], send: Callable[[Origin, str], str],
                  clock: Callable[[], float] = time.monotonic,
                  interval: float = QUEUE_INTERVAL, timeout: float = QUEUE_TIMEOUT,
+                 edge_cap: float = QUEUE_EDGE_CAP,
                  audit: Callable[[str, int, str, str], None] | None = None,
                  stopping: Callable[[], bool] = lambda: False) -> None:
-        for value in (interval, timeout):
+        for value in (interval, timeout, edge_cap):
             if (not isinstance(value, (int, float)) or isinstance(value, bool)
                     or not math.isfinite(value) or value <= 0):
-                raise ValueError("Queue interval and timeout must be finite positive numbers")
+                raise ValueError("Queue timings must be finite positive numbers")
         self._core, self._get, self._prompt, self._send = core, get, prompt, send
         self._clock, self._interval, self._timeout = clock, float(interval), float(timeout)
+        self._edge_cap = float(edge_cap)
         self._audit, self._external_stopping = audit, stopping
         self._queues: dict[str, deque[QueuedPrompt]] = {}
+        self._inflight: dict[str, float] = {}  # pane -> last submit time awaiting its busy edge
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stopped = False
@@ -127,7 +137,7 @@ class SendQueue:
 
     def pending(self, pane_id: str) -> bool:
         with self._lock:
-            return bool(self._queues.get(pane_id))
+            return bool(self._queues.get(pane_id)) or pane_id in self._inflight
 
     def enqueue(self, message: Message, binding: Binding, kind: str) -> None:
         """Caller holds the shared operation lock; the row stays 'processing'."""
@@ -135,6 +145,12 @@ class SendQueue:
         with self._lock:
             self._queues.setdefault(binding.pane_id, deque()).append(entry)
         self._emit(entry, "enqueued", "busy")
+        self._wake.set()
+
+    def mark_submitted(self, pane_id: str) -> None:
+        """Record a send; the pane must prove a busy edge before the next one."""
+        with self._lock:
+            self._inflight[pane_id] = self._clock()
         self._wake.set()
 
     def request_stop(self) -> None:
@@ -146,6 +162,7 @@ class SendQueue:
         with self._lock:
             remaining = sum(len(queue) for queue in self._queues.values())
             self._queues.clear()
+            self._inflight.clear()
         if remaining:
             # Their rows stay 'processing'; startup recovery settles them as
             # 'interrupted'. This log is the required record of the in-memory loss.
@@ -157,20 +174,14 @@ class SendQueue:
                       entry.binding.revision, self._core.bot_open_id, entry.kind,
                       entry.message.chat_type)
 
-    def _finish(self, entry: QueuedPrompt, status: str, code: str) -> None:
+    def _finish(self, entry: QueuedPrompt, status: str, code: str) -> bool:
         try:
             self._core.store.finish(entry.message.message_id, status, code, self._core.clock())
+            return True
         except Exception:
-            pass  # A lost settle stays 'processing' and recovers as 'interrupted'.
+            return False
 
-    def _settle(self, entry: QueuedPrompt, status: str, code: str, notice: str | None) -> None:
-        self._finish(entry, status, code)
-        self._emit(entry, "closed", code)
-        if notice is not None:
-            try:
-                self._send(self._origin(entry), notice)
-            except Exception:
-                pass
+    def _pop(self, entry: QueuedPrompt) -> None:
         with self._lock:
             queue = self._queues.get(entry.binding.pane_id)
             if queue and queue[0] is entry:
@@ -178,12 +189,65 @@ class SendQueue:
             if queue is not None and not queue:
                 del self._queues[entry.binding.pane_id]
 
+    def _settle(self, entry: QueuedPrompt, status: str, code: str, notice: str | None,
+                *, sent: bool = False) -> bool:
+        """Persist the terminal state before any definitive receipt or dequeue.
+
+        Entries whose send was never attempted stay queued when the write fails
+        and are retried by the next poll; once a send was attempted the entry is
+        consumed exactly once regardless of the bookkeeping result.
+        """
+        persisted = self._finish(entry, status, code)
+        if not persisted and not sent:
+            self._emit(entry, "poll", "settle_failed")
+            return False
+        self._emit(entry, "closed", code)
+        if not persisted:
+            self._emit(entry, "poll", "persist_failed")
+        if notice is not None:
+            try:
+                self._send(self._origin(entry), notice)
+            except Exception:
+                pass
+        self._pop(entry)
+        return True
+
+    def _gate(self, entry: QueuedPrompt, agent: Agent, now: float) -> bool:
+        """In-flight edge gate: True when this pane may take the next send."""
+        with self._lock:
+            inflight_at = self._inflight.get(entry.binding.pane_id)
+            if agent.status not in _QUEUE_IDLE:
+                if inflight_at is not None:
+                    del self._inflight[entry.binding.pane_id]
+                    self._emit(entry, "edge", "observed")
+                return False
+            if inflight_at is None:
+                return True
+            if now - inflight_at < self._edge_cap:
+                return False  # Stale-idle window: the busy edge is not proven yet.
+            del self._inflight[entry.binding.pane_id]
+            self._emit(entry, "edge", "unobserved")
+            return True
+
+    def _current_binding(self, entry: QueuedPrompt) -> Binding | None:
+        try:
+            current = self._core.store.get_binding(entry.message.chat_id)
+        except Exception:
+            current = None
+        if (current is None or not current.valid
+                or (current.revision, current.herdr_session, current.workspace_id, current.pane_id)
+                != (entry.binding.revision, entry.binding.herdr_session,
+                    entry.binding.workspace_id, entry.binding.pane_id)):
+            return None
+        return current
+
     def _submit(self, entry: QueuedPrompt) -> bool:
         """One bounded send attempt under the shared operation lock.
 
-        The pane status is re-read inside the lock so a foreground prompt can
-        never interleave between the idle check and the send; the baseline is
-        captured only at this idle point, which is the B14 invariant.
+        The pane status is re-read inside the lock, the in-flight edge gate
+        must be satisfied, and the captured baseline must itself prove an
+        idle/done frame: a busy baseline or a send-point flip keeps the head
+        queued instead of submitting.
         """
         core = self._core
         if not core._lock.acquire(blocking=False):
@@ -196,59 +260,70 @@ class SendQueue:
                 return False
             if agent.workspace_id != entry.binding.workspace_id:
                 core._invalidate_quietly(entry.binding, "prompt")
-                self._settle(entry, "failed", "workspace_mismatch",
-                             "目标 pane 已变化，排队消息未发送。")
-                return True
-            if agent.status not in _QUEUE_IDLE:
+                return self._settle(entry, "failed", "workspace_mismatch",
+                                    "目标 pane 已变化，排队消息未发送。")
+            if not self._gate(entry, agent, self._clock()):
                 return False
-            current = core.store.get_binding(entry.message.chat_id)
-            if (current is None or not current.valid
-                    or (current.revision, current.herdr_session, current.workspace_id, current.pane_id)
-                    != (entry.binding.revision, entry.binding.herdr_session,
-                        entry.binding.workspace_id, entry.binding.pane_id)):
-                self._settle(entry, "failed", "binding_changed",
-                             "绑定已变化，排队消息未发送。")
-                return True
+            if self._current_binding(entry) is None:
+                return self._settle(entry, "failed", "binding_changed",
+                                    "绑定已变化，排队消息未发送。")
             label = core._label(entry.binding)
             capture = None
+            armed = False
             output = core.output
-            if output is not None and entry.message.chat_type == "group":
+            try:
+                if output is not None and entry.message.chat_type == "group":
+                    try:
+                        output.cancel_current(entry.message.chat_id)
+                        capture = output.capture(self._origin(entry), entry.message.text)
+                    except Exception:
+                        capture = None
+                if capture is not None and getattr(
+                        getattr(capture, "_baseline", None), "status", None) not in _QUEUE_IDLE:
+                    # The baseline itself is busy or unproven: cancel and wait.
+                    self._emit(entry, "poll", "baseline_busy")
+                    return False
                 try:
-                    output.cancel_current(entry.message.chat_id)
-                    capture = output.capture(self._origin(entry), entry.message.text)
+                    agent = self._get(entry.binding.pane_id)
                 except Exception:
-                    capture = None
-            current = core.store.get_binding(entry.message.chat_id)
-            if (current is None or not current.valid
-                    or (current.revision, current.workspace_id, current.pane_id)
-                    != (entry.binding.revision, entry.binding.workspace_id, entry.binding.pane_id)):
-                if capture is not None:
+                    self._emit(entry, "poll", "get_failed")
+                    return False
+                if agent.workspace_id != entry.binding.workspace_id:
+                    core._invalidate_quietly(entry.binding, "prompt")
+                    return self._settle(entry, "failed", "workspace_mismatch",
+                                        "目标 pane 已变化，排队消息未发送。")
+                if agent.status not in _QUEUE_IDLE:
+                    self._emit(entry, "poll", "status_changed")
+                    return False  # Flipped between capture and send; keep waiting.
+                if self._current_binding(entry) is None:
+                    return self._settle(entry, "failed", "binding_changed",
+                                        "绑定已变化，排队消息未发送。")
+                try:
+                    self._prompt(entry.binding.pane_id, entry.message.text)
+                except HerdrError as exc:
+                    core._invalidate_quietly(entry.binding, "prompt")
+                    return self._settle(entry, "unknown" if exc.uncertain else "failed",
+                                        exc.code, f"{label}排队消息发送未获确认（{exc.code}）。",
+                                        sent=True)
+                except Exception:
+                    core._invalidate_quietly(entry.binding, "prompt")
+                    return self._settle(entry, "unknown", "internal_error",
+                                        f"{label}排队消息发送失败，请检查现场后重发。",
+                                        sent=True)
+                settled = self._settle(entry, "done", "submitted", None, sent=True)
+                self.mark_submitted(entry.binding.pane_id)
+                if capture is not None and settled:
+                    try:
+                        armed = bool(output.arm(capture))
+                    except Exception:
+                        armed = False  # Auxiliary observation never changes submission.
+                return True
+            finally:
+                if capture is not None and not armed:
                     try:
                         output.cancel(capture)
                     except Exception:
                         pass
-                self._settle(entry, "failed", "binding_changed",
-                             "绑定已变化，排队消息未发送。")
-                return True
-            try:
-                self._prompt(entry.binding.pane_id, entry.message.text)
-            except HerdrError as exc:
-                core._invalidate_quietly(entry.binding, "prompt")
-                self._settle(entry, "unknown" if exc.uncertain else "failed", exc.code,
-                             f"{label}排队消息发送未获确认（{exc.code}）。")
-                return True
-            except Exception:
-                core._invalidate_quietly(entry.binding, "prompt")
-                self._settle(entry, "unknown", "internal_error",
-                             f"{label}排队消息发送失败，请检查现场后重发。")
-                return True
-            self._settle(entry, "done", "submitted", None)
-            if capture is not None:
-                try:
-                    output.arm(capture)
-                except Exception:
-                    pass  # Auxiliary observation must never change submission success.
-            return True
         finally:
             core._lock.release()
 
@@ -267,9 +342,8 @@ class SendQueue:
             if self._stopping():
                 break
             if now - entry.enqueued_at >= self._timeout:
-                self._settle(entry, "failed", "queue_timeout",
-                             f"{self._core._label(entry.binding)}pane 持续忙，未发送。")
-                consumed = True
+                consumed = self._settle(entry, "failed", "queue_timeout",
+                                        f"{self._core._label(entry.binding)}pane 持续忙，未发送。") or consumed
             else:
                 consumed = self._submit(entry) or consumed
         return consumed
@@ -291,6 +365,7 @@ class SendQueue:
 def connect_send_queue(core: BridgeCore, adapter: HerdrAdapter, send: Callable[[Origin, str], str],
                        *, clock: Callable[[], float] = time.monotonic,
                        interval: float = QUEUE_INTERVAL, timeout: float = QUEUE_TIMEOUT,
+                       edge_cap: float = QUEUE_EDGE_CAP,
                        stopping: Callable[[], bool] = lambda: False) -> SendQueue:
     """Wire one volatile send queue; pending entries are lost on restart."""
 
@@ -299,7 +374,7 @@ def connect_send_queue(core: BridgeCore, adapter: HerdrAdapter, send: Callable[[
             "send-queue message=%s revision=%s event=%s reason=%s", ref, revision, event, reason)
 
     queue = SendQueue(core, get=adapter.get_agent, prompt=adapter.prompt, send=send,
-                      clock=clock, interval=interval, timeout=timeout,
+                      clock=clock, interval=interval, timeout=timeout, edge_cap=edge_cap,
                       audit=audit, stopping=stopping)
     core.send_queue = queue
     return queue
@@ -625,6 +700,8 @@ class BridgeCore:
         self._capture_output(message, snapshot, agent)
         self._assert_current(snapshot)  # Capture added reads; never bypass a changed binding.
         self.herdr.prompt(snapshot.pane_id, message.text)
+        if self.send_queue is not None:
+            self.send_queue.mark_submitted(snapshot.pane_id)
         return Reply("done", "submitted", f"{label}已提交，尚未确认任务完成。")
 
     def _stop_output(self) -> None:
