@@ -241,46 +241,34 @@ def _frame(kind: str, raw: str) -> _Frame | None:
     return _Frame(normalized, tuple(blocks), lines[-1][6:])
 
 
-def _occurrences(rows: tuple[str, ...], anchor: tuple[str, ...]) -> int:
-    return sum(rows[i:i + len(anchor)] == anchor for i in range(len(rows) - len(anchor) + 1))
-
-
 def _extract(before: _Frame, after: _Frame, prompt: str) -> Extraction:
     if after.status not in {"idle", "done"}:
         return Extraction(None, "not_ready")
     if before.real is not after.real:
         return Extraction(None, "unrecognized")
-    old, new = before.rows, after.rows
-    if old == new:
+    if before.rows == after.rows:
         return Extraction(None, "unchanged")
-    if new[:len(old)] == old:
-        boundary = len(old)
-    else:
-        boundary = next((k for k in range(min(len(old), len(new)), 0, -1)
-                         if old[-k:] == new[:k]), 0)
-        anchor = new[:boundary]
-        if (boundary == 0 or sum(row.startswith("| ") and bool(row[2:].strip()) for row in anchor) < 2
-                or _occurrences(old, anchor) != 1 or _occurrences(new, anchor) != 1):
-            return Extraction(None, "ambiguous_overlap")
-    if any(block.start < boundary < block.end for block in after.blocks):
-        return Extraction(None, "partial_block")
-    added = [block for block in after.blocks if block.start >= boundary]
-    if not added:
-        return Extraction(None, "unchanged")
-    users = [block for block in added if block.role == "USER"]
-    if not users:
-        return Extraction(None, "waiting_for_prompt")
     # Real Devin echoes hard-wrap and reflow paragraphs; compare whitespace-free.
     want = "".join(prompt.split()) if after.real else prompt
-    mine = added.index(users[0])
-    # A working baseline may have in-flight output legitimately precede the
-    # guidance echo; only an idle/done baseline must echo as the first new block.
-    if (len(users) != 1 or (before.status != "working" and mine != 0)
-            or users[0].text != want):
+    # The new user block is the increment proof itself: this prompt's echo must
+    # appear exactly once in the after frame and be absent from the baseline.
+    # Row-wise tail alignment is unreliable for a working baseline — in-flight
+    # tool rows mutate on completion (Running→Ran) and the window scrolls —
+    # so no transcript overlap is required.
+    anchors = [block for block in after.blocks
+               if block.role == "USER" and block.text == want]
+    if not anchors:
+        return Extraction(None, "waiting_for_prompt")
+    if len(anchors) != 1 or any(block.role == "USER" and block.text == want
+                              for block in before.blocks):
+        return Extraction(None, "ambiguous_overlap")
+    anchor = anchors[0]
+    added = [block for block in after.blocks if block.start >= anchor.end]
+    if any(block.role == "USER" for block in added):
         return Extraction(None, "ambiguous_prompt")
     if any(block.role == "APPROVAL" for block in added):
         return Extraction(None, "attention")
-    body = "\n\n".join(block.text for block in added[mine + 1:]
+    body = "\n\n".join(block.text for block in added
                        if block.role == "ASSISTANT" and block.text.strip())
     if not body or body == prompt:
         return Extraction(None, "echo_only")

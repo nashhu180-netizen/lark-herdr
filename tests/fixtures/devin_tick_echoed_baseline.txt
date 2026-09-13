@@ -1,0 +1,45 @@
+   • 剔除被约束到可证明边界：header 须在转录首行或空行之后（ i == 0 or blank(transcript[i-1]) ）+ 续行封顶  _DEVIN_TIP_CONT_MAX=2
+   + 续行须非空。真实语法中块首行均 0/1 空格，边界后紧贴的 ≥2 空格行只可能是 tip 续行——误吞路径封死。
+   • 负例测试  test_did_you_know_boundary_never_eats_assistant_indents  三例恢复并加强 PR #23 精神。
+
+ 派发实证（o30 .venv 直测  extract_new_text ）：
+
+   • 无关多行两空格缩进块（   - item  /      def  /        pass ）→ body 完整保留；
+   • 真 tip + 空行 + 缩进块同帧 → tip 剔除、缩进块保留；
+   • audit 原反例（header 前非空行）→ header 与正文行均保留。
+
+ 变异验证（基线  af6bc183…64c4 ）：
+
+   • M1  CONT_MAX  2→99 →  9e33eeaa…ef0c  → 反例测试红（KEEP_* 被吞）→ 还原回基线；
+   • M2 去空行边界条件 →  81d384c0…70d3  → 同测试红（非边界 header 被剔）→ 还原回基线， git status  净。
+
+ 独立重跑： unittest discover  → 309 tests OK（41.3s）； compileall  exit 0； git diff --check  工作区 +  main...HEAD  双干净。
+
+ 收敛：A-B9-001 ✓（边界+cap+负例）、A-B9-002 ✓（o24 findings.md:94 改引 §4.2 第 66 行）。残差（不阻断）：>2 行 tip 续行会留存第 3
+ 行起；非边界 header 形行一律保留——均为未观测版式上的保守取舍。
+
+❭ 请只执行 sleep 30 这一条命令，不要做别的
+
+ ⏺ Read shell 210b5e
+ │ Timeout: 30s
+ └ Session: 210b5e
+
+ ⏺ Ran command
+ │ $ sleep 30
+ │ Timeout: 45s
+ │ Exited with code 0 and no output
+ │ Exit code: 0
+ └ Exited with code 0
+
+  sleep 30  已执行完毕（exit 0）。
+
+ ✱ Did you know
+   See all keyboard shortcuts: /shortcuts
+
+❭ 收到后只回复 PONG-F 这四个字符
+
+⣀⡀ Thinking · 5s (esc twice to interrupt)
+───────────────────────────────────────────────────────────────────────────────────────────────────────── (bypass permissions on) ─
+❭ Guide Devin while it works
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+SWE-2 Max                                                                                      Press alt+t to cycle thinking levels

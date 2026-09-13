@@ -100,9 +100,12 @@ class ExtractionTests(unittest.TestCase):
         # Existing users in the baseline do not count as new users in round 2.
         after = screen("devin", old + [second["user"], second["assistant"]])
         self.assertEqual(out.extract_new_text("devin", before, after, second["prompt"]).body, second["expected"])
-        # Equal text with a genuinely new complete USER block is not an old echo.
+        # An identical re-echoed prompt leaves two matching user blocks: the new
+        # one cannot be proven without row alignment, so extraction fails closed.
         repeated = screen("devin", old + [first["user"], second["assistant"]])
-        self.assertEqual(out.extract_new_text("devin", before, repeated, first["prompt"]).body, second["expected"])
+        result = out.extract_new_text("devin", before, repeated, first["prompt"])
+        self.assertIsNone(result.body)
+        self.assertEqual(result.reason, "ambiguous_overlap")
 
     def test_two_new_users_mismatch_substrings_and_ambiguous_wrapping_are_rejected(self):
         first, second = FIXTURE["rounds"]
@@ -112,11 +115,15 @@ class ExtractionTests(unittest.TestCase):
             [second["user"], first["assistant"]],
             [{"role": "USER", "lines": ["prefix " + first["prompt"].replace("\n", " ")]}, first["assistant"]],
             [{"role": "USER", "lines": [first["prompt"].replace("\n", " ")]}, first["assistant"]],
-            [first["assistant"], first["user"], first["assistant"]],
         ]
         for added in additions:
             with self.subTest(added=added):
                 self.assertIsNone(out.extract_new_text("devin", before, screen("devin", FIXTURE["history"] + added), first["prompt"]).body)
+        # A straggler assistant block rendered between the baseline and the new
+        # echo is old-region content: it is excluded, not a veto — only blocks
+        # after the unique new echo count as this round's answer.
+        straggler = screen("devin", FIXTURE["history"] + [first["assistant"], first["user"], first["assistant"]])
+        self.assertEqual(out.extract_new_text("devin", before, straggler, first["prompt"]).body, first["expected"])
 
     def test_tool_approval_and_literal_body_markers_are_distinguished(self):
         first = FIXTURE["rounds"][0]
@@ -141,7 +148,10 @@ class ExtractionTests(unittest.TestCase):
         current = screen("devin", [FIXTURE["history"][-1], first["user"], first["assistant"]])
         self.assertEqual(out.extract_new_text("devin", before, current, first["prompt"]).body, first["expected"])
 
-    def test_ambiguous_short_lost_reordered_and_cleared_anchors_fail_closed(self):
+    def test_scrolled_or_reordered_transcript_still_anchors_on_new_echo(self):
+        # Row-wise alignment between baseline and after is no longer required:
+        # the prompt's own user-block echo is the increment proof. Scrolled,
+        # truncated, or reordered history around it does not veto extraction.
         first = FIXTURE["rounds"][0]
         anchor = FIXTURE["history"][-1]
         tiny = {"role": "ASSISTANT", "lines": ["only one anchor line"]}
@@ -150,11 +160,31 @@ class ExtractionTests(unittest.TestCase):
             (screen("devin", [FIXTURE["history"][0], tiny]), screen("devin", [tiny, first["user"], first["assistant"]])),
             (screen("devin", FIXTURE["history"]), screen("devin", [first["user"], first["assistant"]])),
             (screen("devin", FIXTURE["history"]), screen("devin", list(reversed(FIXTURE["history"])) + [first["user"], first["assistant"]])),
-            (screen("devin", FIXTURE["history"]), screen("devin", [])),
         ]
         for before, current in cases:
             with self.subTest(current=current):
-                self.assertIsNone(out.extract_new_text("devin", before, current, first["prompt"]).body)
+                self.assertEqual(out.extract_new_text("devin", before, current, first["prompt"]).body,
+                                 first["expected"])
+
+    def test_unprovable_or_duplicate_echo_fails_closed(self):
+        first = FIXTURE["rounds"][0]
+        before = screen("devin", FIXTURE["history"])
+        # No echo at all: the pane may not have rendered the prompt yet — wait.
+        cleared = screen("devin", [])
+        result = out.extract_new_text("devin", before, cleared, first["prompt"])
+        self.assertIsNone(result.body)
+        self.assertEqual(result.reason, "waiting_for_prompt")
+        # The echo already in the baseline can never prove a newer round.
+        echoed = screen("devin", FIXTURE["history"] + [first["user"]])
+        answered = screen("devin", FIXTURE["history"] + [first["user"], first["assistant"]])
+        result = out.extract_new_text("devin", echoed, answered, first["prompt"])
+        self.assertIsNone(result.body)
+        self.assertEqual(result.reason, "ambiguous_overlap")
+        # Two matching echoes in the after frame: which is new is unprovable.
+        doubled = screen("devin", FIXTURE["history"] + [first["user"], first["user"], first["assistant"]])
+        result = out.extract_new_text("devin", before, doubled, first["prompt"])
+        self.assertIsNone(result.body)
+        self.assertEqual(result.reason, "ambiguous_overlap")
 
     def test_crlf_and_known_padding_normalization_preserve_inner_unicode_spacing(self):
         first = FIXTURE["rounds"][0]
@@ -316,16 +346,39 @@ class RealDevinExtractionTests(unittest.TestCase):
                                      for block in frame.blocks))
 
     def test_real_frames_scrolled_transcript_fails_closed_overlap(self):
-        # The queue-working and done frames above are minutes apart; the
-        # 80-line visible window scrolled between them, so the baseline is
-        # not a prefix of the after frame and no unique overlap anchor
-        # exists. Extraction fails closed with ambiguous_overlap (F-004
-        # candidate b is real: scrolling breaks alignment; contract keeps
-        # it unsent rather than guessing).
+        # The sampled done frame holds two identical `❭ PONG-D` echoes (the
+        # prompt was submitted twice live); which is the new round is
+        # unprovable, so extraction fails closed with ambiguous_overlap
+        # (F-004 candidate b is real: the contract keeps it unsent rather
+        # than guessing).
         result = out.extract_new_text(
             "devin", self._live_fixture("devin_tick_queue_working.txt"),
             self._live_fixture("devin_tick_done_baseline.txt"),
             "回复标记 PONG-D，收到后只回复这一行")
+        self.assertIsNone(result.body)
+        self.assertEqual(result.reason, "ambiguous_overlap")
+
+    def test_real_working_baseline_anchors_on_late_echo(self):
+        # Issue #24 F-007 live sequence, verbatim w1V:p5 samples: baseline is a
+        # working frame whose in-flight tool block (`○ Running command`, still
+        # expanding) tails the transcript while the second prompt sits queued;
+        # the idle after-frame holds the expanded `⏺ Ran command` block, the
+        # PONG-F echo, and the reply. The echo anchor alone proves the round —
+        # this exact frame pair was ambiguous_overlap under row alignment.
+        result = out.extract_new_text(
+            "devin", self._live_fixture("devin_tick_working_tool_baseline.txt"),
+            self._live_fixture("devin_tick_pong_f_done.txt"),
+            "收到后只回复 PONG-F 这四个字符")
+        self.assertEqual(result.body, "PONG-F")
+
+    def test_real_baseline_already_echoed_fails_closed(self):
+        # f_20 was sampled after the queued prompt was picked up: its transcript
+        # already carries the `❭ PONG-F` echo. As a hypothetical baseline it can
+        # never prove a newer round, so extraction stays ambiguous_overlap.
+        result = out.extract_new_text(
+            "devin", self._live_fixture("devin_tick_echoed_baseline.txt"),
+            self._live_fixture("devin_tick_pong_f_done.txt"),
+            "收到后只回复 PONG-F 这四个字符")
         self.assertIsNone(result.body)
         self.assertEqual(result.reason, "ambiguous_overlap")
 
@@ -466,17 +519,17 @@ class RealDevinExtractionTests(unittest.TestCase):
         self.assertEqual((watch.phase, watch.reason), ("consumed", "sent"))
 
     def test_persistent_ambiguous_overlap_sends_one_notice(self):
-        # The overlap anchor stays non-unique (the new turn re-ran an identical
-        # tool block, so the shared tail occurs twice) -> never provable; the
-        # watch still stops with exactly one safe notice.
+        # An identical echo already in the baseline makes the anchor unprovable
+        # on every poll (the resent-prompt case); the watch still stops with
+        # exactly one safe notice after the transient budget is spent.
         rig = Rig()
         origin = rig.origin()
-        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY)
+        rig.screens[origin.pane_id] = devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT])
         watch = rig.arm(origin, self.PROMPT)
         self.assertIsNotNone(watch)
-        shifted = devin_screen(DEVIN_HISTORY[4:] + ["", "❭ " + self.PROMPT, "", " ⏺ Ran command",
-                                                  " │ $ some command", " │ output line",
-                                                  " └ Exited with code 0"])
+        shifted = devin_screen(DEVIN_HISTORY + ["", "❭ " + self.PROMPT, "", " ⏺ Ran command",
+                                              " │ $ some command", " │ output line",
+                                              " └ Exited with code 0"])
         rig.screens[origin.pane_id] = shifted
         rig.tick()
         for _ in range(out.TRANSIENT_POLLS - 1):
@@ -1003,10 +1056,19 @@ class ObserverTests(unittest.TestCase):
         r.tick(10)
         self.assertEqual(r.messages, [])  # Working polls skip reads entirely.
         self.assertEqual(w2.phase, "watching")
-        # Content without the new echo is never attributed to the newer prompt.
+        # Content without the new echo is never attributed to the newer prompt;
+        # the watch survives — a queued prompt echoes only once Devin picks it up.
         r.states[p2.pane_id] = replace(r.states[p2.pane_id], status="idle")
         r.tick(2.0)
-        self.assertEqual(r.messages, [(p2, "主控 Pane pane-a\n" + out.NOTICE)])
+        self.assertEqual(r.messages, [])
+        self.assertEqual(w2.phase, "watching")
+        # Once the queued prompt echoes and is answered, its body is delivered.
+        first, second = FIXTURE["rounds"]
+        history = FIXTURE["history"] + [first["user"], first["assistant"]]
+        r.answer(p2, 1, history=history)
+        r.tick(2.0)
+        r.tick(2.0)
+        self.assertEqual(r.messages, [(p2, "主控 Pane pane-a\n" + second["expected"])])
         self.assertEqual(r.invalidated, [])
 
     def test_cancel_and_old_handle_cleanup_never_remove_new_round(self):
@@ -1954,9 +2016,10 @@ class CoreOutputIntegrationTests(unittest.TestCase):
         self.assertEqual(set(r.observer._active), {"chat-a"})
         r.answer()
         r.tick(5)
-        # The stale answer does not echo the guidance text: one safe notice.
-        self.assertEqual([(o.chat_id, text) for o, text in r.sent],
-                         [("chat-a", "主控 Pane pane-a\n" + out.NOTICE)])
+        # The stale answer does not echo the guidance text: nothing is sent and
+        # the watch survives — a queued prompt echoes only once Devin picks it up.
+        self.assertEqual(r.sent, [])
+        self.assertEqual(r.observer._active["chat-a"].phase, "watching")
 
     def test_two_chats_poll_only_frozen_targets(self):
         r = self.connect()

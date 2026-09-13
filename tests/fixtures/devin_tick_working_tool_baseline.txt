@@ -1,0 +1,45 @@
+ └ ✓ 5. round2-B9.md 追加增量复核节与最终结论
+
+ B10 增量复核完成， round2-B9.md  已追加「增量复核 1511ea2」一节。
+
+ 最终结论：approved（ main(cf52ca8)...HEAD(1511ea2)  全范围）
+
+ 关于上轮定级：主控指正成立——我实证过机制可吞 flush 两空格行但按「未观测版式」判为非阻断，与派发口径（发现会误吞即 changes-
+ requested）不符，定级偏轻。本轮按 rework-2 收口。
+
+ rework-2 复核（1511ea2）：
+
+   • 剔除被约束到可证明边界：header 须在转录首行或空行之后（ i == 0 or blank(transcript[i-1]) ）+ 续行封顶  _DEVIN_TIP_CONT_MAX=2
+   + 续行须非空。真实语法中块首行均 0/1 空格，边界后紧贴的 ≥2 空格行只可能是 tip 续行——误吞路径封死。
+   • 负例测试  test_did_you_know_boundary_never_eats_assistant_indents  三例恢复并加强 PR #23 精神。
+
+ 派发实证（o30 .venv 直测  extract_new_text ）：
+
+   • 无关多行两空格缩进块（   - item  /      def  /        pass ）→ body 完整保留；
+   • 真 tip + 空行 + 缩进块同帧 → tip 剔除、缩进块保留；
+   • audit 原反例（header 前非空行）→ header 与正文行均保留。
+
+ 变异验证（基线  af6bc183…64c4 ）：
+
+   • M1  CONT_MAX  2→99 →  9e33eeaa…ef0c  → 反例测试红（KEEP_* 被吞）→ 还原回基线；
+   • M2 去空行边界条件 →  81d384c0…70d3  → 同测试红（非边界 header 被剔）→ 还原回基线， git status  净。
+
+ 独立重跑： unittest discover  → 309 tests OK（41.3s）； compileall  exit 0； git diff --check  工作区 +  main...HEAD  双干净。
+
+ 收敛：A-B9-001 ✓（边界+cap+负例）、A-B9-002 ✓（o24 findings.md:94 改引 §4.2 第 66 行）。残差（不阻断）：>2 行 tip 续行会留存第 3
+ 行起；非边界 header 形行一律保留——均为未观测版式上的保守取舍。
+
+❭ 请只执行 sleep 30 这一条命令，不要做别的
+
+ ○ Running command
+ │ $ sleep 30
+ │ Timeout: 45s
+
+⣄⠀ Running tools · 1m 4s (esc twice to interrupt)
+── 1 queued ──────────────────────────────────────────────────────────────────────────────────────────────── ↑ edit · ↵ send now ──
+○ 收到后只回复 PONG-F 这四个字符
+───────────────────────────────────────────────────────────────────────────────────────────────────────── (bypass permissions on) ─
+❭ Press Enter to send queued messages now
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+SWE-2 Max                                                                                         Context: 162k / 262k tokens (62%)
+1 shell · ↓ select
