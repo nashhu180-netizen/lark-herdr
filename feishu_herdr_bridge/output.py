@@ -66,7 +66,13 @@ class _Frame:
 
 
 # Real Devin CLI chrome markers (sampled visible layout; see tests for fixtures).
-_DEVIN_STATUS = re.compile(r"\S(?:.*?\S)?\s+Context: [0-9.]+[kKmM]? / [0-9.]+[kKmM]? tokens \([0-9]+%\)")
+# The status bar cycles between several tails; all are exact literals observed
+# on real panes (Issue #28 samples plus verbatim sightings on o24 panes).
+_DEVIN_STATUS = re.compile(
+    r"\S(?:.*?\S)?\s+(?:Context: [0-9.]+[kKmM]? / [0-9.]+[kKmM]? tokens \([0-9]+%\)"
+    r"|Press alt\+t to cycle thinking levels"
+    r"|See usage and cost: /session-stats"
+    r"|Press Ctrl\+L to clear the screen, Ctrl\+Shift\+L to redraw)")
 _DEVIN_RULE = re.compile(r"─+")
 _DEVIN_RULE_TOP = re.compile(r"─+( \([^()]*\) ─+)?")
 _DEVIN_SPINNER = re.compile(r"\(esc (?:(?:twice|again) )?to interrupt[^()]*\)"
