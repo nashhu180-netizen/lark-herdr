@@ -86,10 +86,15 @@ _DEVIN_QUEUE_INPUT = "❭ Press Enter to send queued messages now"
 _DEVIN_TOOL_HEAD = re.compile(r" [○◐◔◑◕⏺] ")
 _DEVIN_USER_CONT = re.compile(r"  \S")
 _DEVIN_TOOL_BODY = ("│", " │", " └")
-_DEVIN_DID_YOU_KNOW_TIP = (
-    " ✱ Did you know",
-    "   Use /bug to report a bug to the Devin CLI developers",
-)
+# Did-you-know tips are cycling UI hints, not transcript content. The exact
+# header line is dropped only at a provable UI boundary — it must sit at the
+# transcript start or right after a blank row — and at most two deeper-
+# indented continuation lines directly under it go with it (real samples all
+# carry exactly one). Anything past that boundary is kept: indented assistant
+# body (code blocks, lists) is a legal transcript shape and must never be
+# silently eaten (text is not enumerated).
+_DEVIN_DID_YOU_KNOW = " ✱ Did you know"
+_DEVIN_TIP_CONT_MAX = 2
 
 
 def _devin_frame(lines: list[str]) -> _Frame | None:
@@ -124,10 +129,18 @@ def _devin_frame(lines: list[str]) -> _Frame | None:
 
     while transcript and blank(transcript[-1]):
         transcript.pop()  # Pre-chrome blank rows are spacing, not transcript.
-    if tuple(transcript[-2:]) == _DEVIN_DID_YOU_KNOW_TIP:
-        del transcript[-2:]
-        while transcript and blank(transcript[-1]):
-            transcript.pop()
+    i = 0
+    while i < len(transcript):
+        if (transcript[i] == _DEVIN_DID_YOU_KNOW
+                and (i == 0 or blank(transcript[i - 1]))):
+            del transcript[i]
+            taken = 0
+            while (i < len(transcript) and taken < _DEVIN_TIP_CONT_MAX
+                   and transcript[i].startswith("  ") and transcript[i].strip()):
+                del transcript[i]
+                taken += 1
+        else:
+            i += 1
     blocks: list[_Block] = []
     i, n = 0, len(transcript)
 

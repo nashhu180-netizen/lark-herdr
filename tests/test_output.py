@@ -196,8 +196,13 @@ class RealDevinExtractionTests(unittest.TestCase):
         after = self.round(" P1_LIVE_OK")
         self.assertEqual(out.extract_new_text("devin", before, after, self.PROMPT).body, "P1_LIVE_OK")
 
-    def test_exact_did_you_know_tip_after_answer_is_not_returned(self):
+    def test_did_you_know_tip_blocks_drop_by_structure_not_text(self):
+        # Did-you-know tips are UI chrome: the header line and its
+        # deeper-indented continuation lines are dropped wherever the block
+        # appears, without enumerating tip texts (Issue #30 P3; supersedes
+        # the earlier single-text exclusion from b6de85e).
         before = devin_screen(DEVIN_HISTORY)
+        # Sample 1: the b6de85e-era tip, at the transcript tail.
         after = self.round(
             " P1_LIVE_OK", "", " ✱ Did you know",
             "   Use /bug to report a bug to the Devin CLI developers",
@@ -206,14 +211,123 @@ class RealDevinExtractionTests(unittest.TestCase):
             out.extract_new_text("devin", before, after, self.PROMPT).body,
             "P1_LIVE_OK",
         )
+        # Sample 2: the verbatim tip that leaked into a live auto-return.
+        mid = self.round(
+            " ✱ Did you know",
+            "   Use Shift+Tab to cycle permission modes, and /plan and "
+            "/ask to switch profiles",
+            "", " P1_LIVE_OK",
+        )
+        self.assertEqual(
+            out.extract_new_text("devin", before, mid, self.PROMPT).body,
+            "P1_LIVE_OK",
+        )
+        # Sample 3: another verbatim tip text seen on Devin CLI.
+        other = self.round(
+            " P1_LIVE_OK", "", " ✱ Did you know",
+            "   Type @ to mention files and add them as context",
+        )
+        self.assertEqual(
+            out.extract_new_text("devin", before, other, self.PROMPT).body,
+            "P1_LIVE_OK",
+        )
+
+    def test_tip_header_at_boundary_drops_following_indent_line(self):
+        # Semantic change per decisions D-004 (structure rule wins): the old
+        # PR #23 near-match input — exact header at a UI boundary followed by
+        # one arbitrary indented line — is a provable tip block and the whole
+        # block is dropped now. The old "arbitrary text stays" guarantee is
+        # carried by the three boundary counterexamples below instead.
+        before = devin_screen(DEVIN_HISTORY)
         near_match = self.round(
             " P1_LIVE_OK", "", " ✱ Did you know",
             "   Arbitrary assistant text must remain visible",
         )
-        self.assertIn(
-            "Arbitrary assistant text must remain visible",
+        self.assertEqual(
             out.extract_new_text("devin", before, near_match, self.PROMPT).body,
+            "P1_LIVE_OK",
         )
+
+    def test_did_you_know_boundary_never_eats_assistant_indents(self):
+        # Negative coverage restored (PR #23 near-match spirit): only a tip
+        # at a provable UI boundary — exact header at frame start or after a
+        # blank row, plus at most two indented continuations — is dropped.
+        before = devin_screen(DEVIN_HISTORY)
+        # (1) Header with a non-blank previous row is not a tip block: the
+        # header and the indented line under it are assistant body.
+        mid_body = self.round(
+            " P1_LIVE_OK", " ✱ Did you know", "   still assistant body",
+        )
+        body = out.extract_new_text("devin", before, mid_body, self.PROMPT).body
+        self.assertIn("Did you know", body)
+        self.assertIn("still assistant body", body)
+        # (2) A tip block eats at most two continuation lines; a longer
+        # indented run keeps the remainder.
+        over = self.round(
+            " P1_LIVE_OK", "", " ✱ Did you know",
+            "   cont one", "   cont two", "   KEEP_THREE", "   KEEP_FOUR",
+        )
+        body = out.extract_new_text("devin", before, over, self.PROMPT).body
+        self.assertNotIn("cont one", body)
+        self.assertNotIn("cont two", body)
+        self.assertIn("KEEP_THREE", body)
+        self.assertIn("KEEP_FOUR", body)
+        # (3) Indented assistant body with no tip header is untouched.
+        plain = self.round(
+            " P1_LIVE_OK", "   indent a", "   indent b", "   indent c",
+        )
+        body = out.extract_new_text("devin", before, plain, self.PROMPT).body
+        self.assertIn("indent a", body)
+        self.assertIn("indent b", body)
+        self.assertIn("indent c", body)
+
+    @staticmethod
+    def _live_fixture(name):
+        return (Path(__file__).parent / "fixtures" / name).read_text(encoding="utf-8")
+
+    def test_real_frames_verbatim_reply_declines_echo_only(self):
+        # Issue #24 F-004/F-005: the live deadline traced to a Devin reply
+        # byte-identical to its prompt — `echo_only` is the contractual
+        # refusal (a candidate identical to the prompt is not sent), and
+        # marker-protocol validations must use non-verbatim replies.
+        # Frames are verbatim w1V:p5 samples: baseline = done state before
+        # the marker prompt; after = marker echo plus the verbatim reply.
+        result = out.extract_new_text(
+            "devin", self._live_fixture("devin_tick_done_baseline.txt"),
+            self._live_fixture("devin_tick_marker_echo_done.txt"),
+            "ISSUE24 验收标记 D")
+        self.assertIsNone(result.body)
+        self.assertEqual(result.reason, "echo_only")
+
+    def test_real_frames_tip_blocks_never_enter_body(self):
+        # The real sampled working-queue frame (second sleep running,
+        # PONG-D queued) and the done frame (queued prompt answered) both
+        # parse; every Did-you-know tip in them is removed structurally —
+        # no tip row or tip text survives in the parsed frame.
+        for name in ("devin_tick_queue_working.txt",
+                     "devin_tick_done_baseline.txt",
+                     "devin_tick_marker_echo_done.txt"):
+            with self.subTest(fixture=name):
+                frame = out._frame("devin", self._live_fixture(name))
+                self.assertIsNotNone(frame)
+                self.assertFalse(any("Did you know" in row
+                                     for row in frame.rows))
+                self.assertFalse(any("Did you know" in block.text
+                                     for block in frame.blocks))
+
+    def test_real_frames_scrolled_transcript_fails_closed_overlap(self):
+        # The queue-working and done frames above are minutes apart; the
+        # 80-line visible window scrolled between them, so the baseline is
+        # not a prefix of the after frame and no unique overlap anchor
+        # exists. Extraction fails closed with ambiguous_overlap (F-004
+        # candidate b is real: scrolling breaks alignment; contract keeps
+        # it unsent rather than guessing).
+        result = out.extract_new_text(
+            "devin", self._live_fixture("devin_tick_queue_working.txt"),
+            self._live_fixture("devin_tick_done_baseline.txt"),
+            "回复标记 PONG-D，收到后只回复这一行")
+        self.assertIsNone(result.body)
+        self.assertEqual(result.reason, "ambiguous_overlap")
 
     def test_tool_lines_and_blank_separators_are_not_body(self):
         before = devin_screen(DEVIN_HISTORY)
